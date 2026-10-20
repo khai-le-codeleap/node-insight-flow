@@ -65,6 +65,7 @@
   .tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); }
   .tag.error { background: transparent; border: 1px solid var(--err); color: var(--err); }
   .loc { flex-basis: 100%; min-width: 0; overflow-wrap: anywhere; color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre mark.fn { background: var(--accent-soft); color: var(--accent); font-weight: 700; border-radius: 3px; padding: 0 1px; }
   pre { tab-size: 2; margin: 0; padding: 10px 12px; background: var(--code-bg); border-top: 1px solid var(--border); overflow-x: auto; font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
   .section { margin: 14px 2px 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
   #files { flex: none; width: 340px; border-right: 1px solid var(--border); background: var(--bg); display: flex; flex-direction: column; min-width: 0; }
@@ -95,6 +96,12 @@
   #tree.selecting svg.arrows path:not(.main) { opacity: .12; }
   #tree.selecting svg.arrows path.hot { opacity: 1; stroke-width: 2.5; }
   #tree.by-node .chip[data-srcs]:not(.hot) { opacity: .3; }
+  #tree.by-node .row.selected { color: var(--text); }
+  #tree.by-node .row.sym:not(.hit):not(.entry) .name { opacity: .45; }
+  .row.hit .name { font-weight: 700; opacity: 1; }
+  .row.hit-calls { box-shadow: inset 3px 0 0 var(--accent); } .row.hit-calls .name { color: var(--accent); }
+  .row.hit-uses { box-shadow: inset 3px 0 0 var(--uses); } .row.hit-uses .name { color: var(--uses); }
+  .row.hit-alt { box-shadow: inset 3px 0 0 var(--alt); } .row.hit-alt .name { color: var(--alt); }
   .row { padding-right: 10px; cursor: pointer; font-size: 13px; }
   .row .line { height: 26px; display: flex; align-items: center; gap: 6px; white-space: nowrap; min-width: 0; }
   .chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 0 6px 16px; }
@@ -209,7 +216,25 @@ function editorLink(loc, text = "Open in VS Code") {
   return a;
 }
 
-function card(name, location, code, tags = [], link = null) {
+// `new X` → X, `Class.method` → method: the identifier as it appears at the call
+const callName = (n) => n.replace(/^new /, "").split(".").pop();
+
+/** Code with the given identifiers marked (whole words only). */
+function codeEl(code, marks) {
+  const pre = el("pre");
+  const names = [...new Set(marks.filter(Boolean))].map((m) => m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  if (!names.length) return (pre.textContent = code), pre;
+  const re = new RegExp(`\\b(${names.join("|")})\\b`, "g");
+  let last = 0;
+  for (const m of code.matchAll(re)) {
+    pre.append(code.slice(last, m.index), el("mark", "fn", m[0]));
+    last = m.index + m[0].length;
+  }
+  pre.append(code.slice(last));
+  return pre;
+}
+
+function card(name, location, code, tags = [], link = null, marks = []) {
   const c = el("article", "card");
   const head = el("div", "card-head");
   head.append(el("span", "card-name", name));
@@ -217,7 +242,7 @@ function card(name, location, code, tags = [], link = null) {
   if (link) head.append(link);
   if (/:\d+$/.test(location)) head.append(editorLink(location));
   head.append(el("span", "loc", location));
-  c.append(head, el("pre", null, code));
+  c.append(head, codeEl(code, marks));
   return c;
 }
 
@@ -258,7 +283,7 @@ function show(id) {
       steps.append(card(c.name, c.location, c.code, via ? [[`via ${via}`]] : [], go));
     }
     steps.append(el("div", "section", "Code"));
-    steps.append(card(DATA.title.replace(/^flow of /, ""), DATA.entry, DATA.code));
+    steps.append(card(DATA.title.replace(/^flow of /, ""), DATA.entry, DATA.code, [], null, DATA.nodes.flatMap((n) => n.callees.map((c) => callName(c.name)))));
     if (DATA.unresolved.length) {
       steps.append(el("div", "section", "Unresolved calls (no declaration known to the checker)"));
       steps.append(card("", "", DATA.unresolved.map((u) => `${u.location}  ${u.text}`).join("\n")));
@@ -266,7 +291,7 @@ function show(id) {
     return;
   }
   $("#side-title").textContent = n.label;
-  steps.append(card("statement", n.location, n.code));
+  steps.append(card("statement", n.location, n.code, [], null, n.callees.map((c) => callName(c.name))));
   if (n.callees.length) steps.append(el("div", "section", "Calls"));
   for (const c of n.callees) {
     const open = el("a", null, "Open flow →");
@@ -275,7 +300,7 @@ function show(id) {
     if (c.via) tags.push([`implements ${c.via}`]);
     if (c.abstract) tags.push(["interface"]);
     if (c.error) tags.push(["error", "error"]);
-    steps.append(card(c.name, c.location, c.code, tags, open));
+    steps.append(card(c.name, c.location, c.code, tags, open, [callName(c.name)]));
   }
 }
 
@@ -495,6 +520,7 @@ function drawTree() {
     } else {
       const file = r.file ?? r.key;
       row.dataset.file = file;
+      row.dataset.place = r.key;
       if (r.key === g.entry) row.classList.add("entry");
       if (g.main.includes(r.key)) row.classList.add("on-main");
       if (file === graph.selected) row.classList.add("selected");
@@ -627,6 +653,13 @@ function highlight() {
   $("#tree").classList.toggle("selecting", !!f);
   $("#tree").classList.toggle("by-node", !!(f && node));
   document.querySelectorAll("#tree svg.arrows path[data-from]").forEach((p) => p.classList.toggle("hot", hot(p)));
+  // rows a lit arrow points at, coloured like the arrow
+  const hits = {};
+  if (node) for (const p of document.querySelectorAll("#tree svg.arrows path.hot")) hits[p.dataset.to] ??= p.getAttribute("class").split(" ")[0];
+  document.querySelectorAll("#tree .row[data-place]").forEach((r) => {
+    r.classList.remove("hit", "hit-calls", "hit-uses", "hit-alt");
+    if (hits[r.dataset.place]) r.classList.add("hit", `hit-${hits[r.dataset.place]}`);
+  });
   document.querySelectorAll("#tree .chip[data-srcs]").forEach((c) => c.classList.toggle("hot", !!node && hot(c)));
   document.querySelectorAll("#tree .row[data-file]").forEach((r) => r.classList.toggle("selected", r.dataset.file === f));
   document.querySelectorAll("#canvas .node.infile").forEach((n) => n.classList.remove("infile"));
