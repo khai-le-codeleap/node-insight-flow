@@ -541,8 +541,10 @@ function callFlow(project, entry, a) {
     });
   }
 
-  const esc = (t) => t.replace(/"/g, "#quot;");
-  const label = (n) => esc(`${n.name}<br/>${rel(n.file)}:${at(n.file, n.decl.getStart()).line}${n.unexpanded ? "<br/>(not expanded)" : ""}`);
+  // Mermaid labels are HTML: names can carry string literals from code, so escape everything markup-ish.
+  const esc = (t) => t.replace(/&/g, "#amp;").replace(/"/g, "#quot;").replace(/</g, "#lt;").replace(/>/g, "#gt;");
+  const lineOf = (n) => at(n.file, n.decl.getStart()).line;
+  const label = (n) => [n.name, `${rel(n.file)}:${lineOf(n)}`, ...(n.unexpanded ? ["(not expanded)"] : [])].map(esc).join("<br/>");
   const all = [...nodes.values()];
   const mermaid = ["flowchart TD"];
   for (const n of all) {
@@ -555,15 +557,38 @@ function callFlow(project, entry, a) {
     else mermaid.push(`  ${e.from.id} -->|"${e.order}"| ${e.to.id}`);
   }
 
-  let out = `flow of ${entry.name} (${rel(entry.file)}:${at(entry.file, entry.decl.getStart()).line}): ${all.length} steps, depth ${depth}`;
+  const data = {
+    title: `flow of ${entry.name}`,
+    entry: `${rel(entry.file)}:${lineOf(entry)}`,
+    depth,
+    maxNodes,
+    truncated,
+    mermaid: mermaid.join("\n"),
+    steps: all.map((n) => ({
+      id: n.id,
+      name: n.name,
+      location: `${rel(n.file)}:${lineOf(n)}`,
+      abstract: n.abstract,
+      unexpanded: n.unexpanded,
+      externals: [...n.externals],
+      code: codeOf(n, maxLines),
+    })),
+    unresolved: uniq(unresolved).map((h) => ({ location: `${rel(h.file)}:${h.line}`, text: h.text })),
+  };
+  if (a.format === "json") return JSON.stringify(data);
+
+  let out = `${data.title} (${data.entry}): ${all.length} steps, depth ${depth}`;
   if (truncated) out += `, stopped at maxNodes=${maxNodes}`;
-  out += "\n\n```mermaid\n" + mermaid.join("\n") + "\n```\n";
-  for (const n of all) {
-    out += `\n### ${n.id} ${n.name}${n.abstract ? " (interface)" : ""} — ${rel(n.file)}:${at(n.file, n.decl.getStart()).line}\n`;
-    if (n.externals.size) out += `library calls: ${[...n.externals].join(", ")}\n`;
-    out += "```ts\n" + codeOf(n, maxLines) + "\n```\n";
+  out += "\n\n```mermaid\n" + data.mermaid + "\n```\n";
+  for (const st of data.steps) {
+    out += `\n### ${st.id} ${st.name}${st.abstract ? " (interface)" : ""} — ${st.location}\n`;
+    if (st.externals.length) out += `library calls: ${st.externals.join(", ")}\n`;
+    out += "```ts\n" + st.code + "\n```\n";
   }
-  if (unresolved.length) out += `\nunresolved calls (no declaration known to the checker, e.g. \`any\`):\n${fmt(uniq(unresolved))}\n`;
+  if (data.unresolved.length) {
+    out += `\nunresolved calls (no declaration known to the checker, e.g. \`any\`):\n`;
+    out += data.unresolved.map((u) => `${u.location}  ${u.text}`).join("\n") + "\n";
+  }
   return out.trimEnd();
 }
 

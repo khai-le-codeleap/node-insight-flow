@@ -34,7 +34,7 @@ The binary loads `sidecar/ts.cjs` from this repo, so keep the repo where it was 
 | `type_info` | Hover: inferred type + JSDoc |
 | `rename_preview` | Every `-old/+new` line a rename would produce; writes nothing |
 | `diagnostics` | Type errors for a file or directory (`maxResults`) |
-| `call_flow` | Flow of a function / API handler: Mermaid diagram + the code of every step. Built only from the type checker: calls resolved with `getResolvedSignature`, interface/service members followed to implementations, conditional calls dashed, library calls listed per step, unresolvable calls listed separately. Entry is the handler (`symbol`, or `file` + `line` inside an inline handler) |
+| `call_flow` | Flow of a function / API handler: Mermaid diagram + the code of every step. Built only from the type checker: calls resolved with `getResolvedSignature`, interface/service members followed to implementations, conditional calls dashed, library calls listed per step, unresolvable calls listed separately. Entry is the handler (`symbol`, or `file` + `line` inside an inline handler). The result starts with a `http://127.0.0.1:<port>/flow?…` link to an interactive page (diagram + code, click a step to jump to its code) |
 | `ts_projects` | tsconfig projects found, file counts, TS version |
 | `ts_reload` | Rebuild all TS projects from scratch |
 
@@ -49,6 +49,10 @@ An ambiguous name returns the list of candidates instead of guessing.
 - The project's own `typescript` is used when it has the JS LanguageService (TS < 7). TypeScript 7 (native) has no such API, so those projects use the bundled TypeScript 6.0.3.
 - Monorepos: every `tsconfig.json` under the root (skipping `node_modules`, `dist`, `build`…) plus their `references` becomes its own project with its own LanguageService, built at startup (or on first use after being freed) and freed after 10 min idle. A file belongs to the deepest tsconfig that includes it. `find_references`, `rename_preview` and `incoming_calls` run in every project that sees the file and merge results, so usages in other packages are found (sources of referenced projects are used, like tsserver). Solution-style configs (`"files": []`) are skipped. `ts_projects` shows what was found.
 - It runs alongside VSCode's tsserver, not shared with it.
+
+## call_flow page
+
+The first `call_flow` call binds an HTTP server on `127.0.0.1` (random port) inside the MCP process. The page URL carries the call's arguments, so every load or Reload re-runs the analysis against the current code. Mermaid is served from `sidecar/node_modules` (no CDN). Requests whose `Host` isn't `127.0.0.1:<port>` / `localhost:<port>` are refused, so other websites can't read your code through DNS rebinding.
 
 ## Test
 

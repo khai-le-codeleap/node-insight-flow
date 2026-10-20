@@ -1,10 +1,13 @@
 //! project-mcp: MCP server (stdio, newline-delimited JSON-RPC) for exploring a project.
 //! Semantic TS/JS tools are served by a Bun sidecar (sidecar/ts.cjs) running TypeScript's LanguageService.
+//! `call_flow` pages are served over HTTP on 127.0.0.1 by this same process.
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
@@ -14,13 +17,20 @@ type R = Result<String, String>;
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_LINE_CHARS: usize = 200;
 const SIDECAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/sidecar/ts.cjs");
+const MERMAID_JS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/sidecar/node_modules/mermaid/dist/mermaid.min.js");
+const FLOW_HTML: &str = include_str!("flow.html");
+
+/// The sidecar, shared by the stdio loop and the HTTP thread.
+type Ts = Arc<Mutex<Option<Sidecar>>>;
 const SEMANTIC: &[&str] = &["go_to_definition", "find_references", "incoming_calls", "type_info", "rename_preview", "diagnostics", "ts_projects", "ts_reload", "call_flow"];
 
 fn main() {
     let root = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap());
     let root = root.canonicalize().unwrap_or_else(|e| panic!("invalid root {}: {e}", root.display()));
-    // Started on the first semantic call, then kept for the session.
-    let mut ts: Option<Sidecar> = None;
+    // Started on initialize or the first semantic call, then kept for the session.
+    let ts: Ts = Arc::new(Mutex::new(None));
+    // HTTP port for call_flow pages, bound on the first call_flow.
+    let mut web: Option<u16> = None;
     let mut out = io::stdout().lock();
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -40,8 +50,9 @@ fn main() {
             "initialize" => {
                 // Start the sidecar now so it builds the TS programs while the client gets going.
                 // shortcut: only when the root looks like a JS/TS project; other roots start it on first use.
-                if ts.is_none() && ["tsconfig.json", "jsconfig.json", "package.json"].iter().any(|f| root.join(f).exists()) {
-                    ts = Sidecar::spawn(&root).ok();
+                let mut guard = lock(&ts);
+                if guard.is_none() && ["tsconfig.json", "jsconfig.json", "package.json"].iter().any(|f| root.join(f).exists()) {
+                    *guard = Sidecar::spawn(&root).ok();
                 }
                 json!({
                 "protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
@@ -51,7 +62,7 @@ fn main() {
             }
             "ping" => json!({}),
             "tools/list" => json!({"tools": tools()}),
-            "tools/call" => call(&root, &mut ts, &msg["params"]),
+            "tools/call" => call(&root, &ts, &mut web, &msg["params"]),
             m => {
                 send(&mut out, json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("method not found: {m}")}}));
                 continue;
@@ -116,7 +127,7 @@ Entry: the handler's `symbol`, or `file` + `line` anywhere inside an inline hand
     ])
 }
 
-fn call(root: &Path, ts: &mut Option<Sidecar>, params: &Value) -> Value {
+fn call(root: &Path, ts: &Ts, web: &mut Option<u16>, params: &Value) -> Value {
     let a = &params["arguments"];
     let res = match params["name"].as_str().unwrap_or("") {
         "project_overview" => project_overview(root),
@@ -125,7 +136,16 @@ fn call(root: &Path, ts: &mut Option<Sidecar>, params: &Value) -> Value {
         "list_logs" => list_logs(root, a),
         "read_log" => read_log(root, a),
         "summarize_log" => summarize_log(root, a),
-        n if SEMANTIC.contains(&n) => semantic(root, ts, n, a),
+        "call_flow" => semantic(root, &mut lock(ts), "call_flow", a).map(|text| {
+            if web.is_none() {
+                *web = start_web(root.to_path_buf(), ts.clone()).map_err(|e| eprintln!("project-mcp: HTTP server: {e}")).ok();
+            }
+            match web {
+                Some(port) => format!("open in browser: {}\n\n{text}", flow_url(*port, a)),
+                None => text,
+            }
+        }),
+        n if SEMANTIC.contains(&n) => semantic(root, &mut lock(ts), n, a),
         n => Err(format!("unknown tool: {n}")),
     };
     let (text, is_error) = match res {
@@ -188,6 +208,135 @@ fn semantic(root: &Path, ts: &mut Option<Sidecar>, tool: &str, a: &Value) -> R {
             Err(e.to_string())
         }
     }
+}
+
+fn lock(ts: &Ts) -> MutexGuard<'_, Option<Sidecar>> {
+    ts.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// ---------- call_flow web page ----------
+
+/// call_flow args carried in the page URL, so each load re-runs against the current code.
+const FLOW_ARGS: &[&str] = &["symbol", "file", "line", "column", "depth", "maxNodes", "maxLines", "includeTests"];
+
+fn start_web(root: PathBuf, ts: Ts) -> io::Result<u16> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            if let Err(e) = serve(&root, &ts, port, stream) {
+                eprintln!("project-mcp: HTTP: {e}");
+            }
+        }
+    });
+    Ok(port)
+}
+
+fn flow_url(port: u16, a: &Value) -> String {
+    let q: Vec<String> = FLOW_ARGS
+        .iter()
+        .filter_map(|k| {
+            let v = a.get(*k)?;
+            let v = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+            Some(format!("{k}={}", pct_encode(&v)))
+        })
+        .collect();
+    format!("http://127.0.0.1:{port}/flow?{}", q.join("&"))
+}
+
+fn serve(root: &Path, ts: &Ts, port: u16, mut stream: TcpStream) -> io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request = String::new();
+    reader.read_line(&mut request)?;
+    let mut host = String::new();
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h)? == 0 || h.trim().is_empty() {
+            break;
+        }
+        if let Some((k, v)) = h.split_once(':') {
+            if k.eq_ignore_ascii_case("host") {
+                host = v.trim().to_string();
+            }
+        }
+    }
+    // DNS-rebinding guard: a web page can make the browser hit this port under its own hostname.
+    if host != format!("127.0.0.1:{port}") && host != format!("localhost:{port}") {
+        return respond(&mut stream, "403 Forbidden", "text/plain", b"forbidden host");
+    }
+    let target = request.split_whitespace().nth(1).unwrap_or("/");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    match path {
+        "/mermaid.js" => match std::fs::read(MERMAID_JS) {
+            Ok(js) => respond(&mut stream, "200 OK", "text/javascript", &js),
+            Err(e) => respond(&mut stream, "500 Internal Server Error", "text/plain", format!("{MERMAID_JS}: {e} (run `bun install` in sidecar/)").as_bytes()),
+        },
+        "/flow" => {
+            let mut a = query_args(query);
+            a["format"] = json!("json");
+            match semantic(root, &mut lock(ts), "call_flow", &a) {
+                // `</` inside the inlined JSON would end the <script> early.
+                Ok(data) => respond(&mut stream, "200 OK", "text/html; charset=utf-8", FLOW_HTML.replace("/*DATA*/null", &data.replace("</", "<\\/")).as_bytes()),
+                Err(e) => respond(&mut stream, "400 Bad Request", "text/plain; charset=utf-8", e.as_bytes()),
+            }
+        }
+        _ => respond(&mut stream, "404 Not Found", "text/plain", b"not found"),
+    }
+}
+
+fn respond(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8]) -> io::Result<()> {
+    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", body.len())?;
+    stream.write_all(body)
+}
+
+/// Query string -> call_flow args (numbers and booleans typed, unknown keys dropped).
+fn query_args(query: &str) -> Value {
+    let mut a = json!({});
+    for (k, v) in query.split('&').filter_map(|kv| kv.split_once('=')) {
+        if !FLOW_ARGS.contains(&k) {
+            continue;
+        }
+        let v = pct_decode(v);
+        a[k] = match k {
+            "symbol" | "file" => json!(v),
+            "includeTests" => json!(v == "true" || v == "1"),
+            _ => v.parse::<u64>().map_or(Value::Null, |n| json!(n)),
+        };
+    }
+    a
+}
+
+fn pct_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = b.get(i + 1..i + 3).filter(|h| h.iter().all(u8::is_ascii_hexdigit));
+        match (b[i], hex) {
+            (b'%', Some(h)) => {
+                out.push(u8::from_str_radix(std::str::from_utf8(h).unwrap(), 16).unwrap());
+                i += 3;
+            }
+            (b'+', _) => {
+                out.push(b' ');
+                i += 1;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ---------- helpers ----------
@@ -531,6 +680,32 @@ mod tests {
         // Entry by line inside the function also works.
         let by_line = semantic(&root, &mut ts, "call_flow", &json!({"file": "src/flow.ts", "line": 21})).unwrap();
         assert!(by_line.contains("([\"handle"), "{by_line}");
+    }
+
+    #[test]
+    fn url_args_round_trip() {
+        let a = json!({"symbol": "a b/ç&x", "line": 12, "includeTests": true});
+        let url = flow_url(1, &a);
+        let back = query_args(url.split_once('?').unwrap().1);
+        assert_eq!(back, a);
+        assert_eq!(pct_decode("%zz%4"), "%zz%4");
+    }
+
+    #[test]
+    fn web_serves_flow_page_and_rejects_foreign_host() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture").canonicalize().unwrap();
+        let port = start_web(root, Arc::new(Mutex::new(None))).unwrap();
+        let get = |path: &str, host: &str| {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").unwrap();
+            let mut body = String::new();
+            s.read_to_string(&mut body).unwrap();
+            body
+        };
+        let page = get("/flow?symbol=handle&file=src/flow.ts", &format!("127.0.0.1:{port}"));
+        assert!(page.starts_with("HTTP/1.1 200") && page.contains("\"name\":\"memRepo.find\""), "{}", &page[..page.len().min(400)]);
+        assert!(get("/mermaid.js", &format!("localhost:{port}")).starts_with("HTTP/1.1 200"));
+        assert!(get("/flow?symbol=handle", "evil.example:80").starts_with("HTTP/1.1 403"));
     }
 
     fn copy_dir(from: &Path, to: &Path) {

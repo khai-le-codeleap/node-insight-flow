@@ -2,6 +2,7 @@
   "name": "project-mcp-sidecar",
   "private": true,
   "dependencies": {
+    "mermaid": "11",
     "typescript": "6.0.3"
   }
 }

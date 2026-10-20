@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call flow</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70; --border: #e2e2e0;
+    --accent: #2f6fde; --accent-soft: #e7effc; --code-bg: #f3f3f1; --warn: #a15c00;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151517; --panel: #1e1e21; --text: #ececee; --muted: #9a9aa2; --border: #33333a;
+      --accent: #6f9cf0; --accent-soft: #24304a; --code-bg: #18181b; --warn: #e0a050;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--panel); display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .meta { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  header a { color: var(--accent); font-size: 13px; margin-left: auto; text-decoration: none; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 46%); height: calc(100vh - 53px); }
+  #diagram { overflow: auto; padding: 20px; border-right: 1px solid var(--border); }
+  #diagram svg { max-width: none; height: auto; }
+  #diagram .node { cursor: pointer; }
+  #diagram .node.active rect, #diagram .node.active polygon, #diagram .node.active path { stroke: var(--accent) !important; stroke-width: 3px !important; }
+  #steps { overflow: auto; padding: 16px; }
+  .step { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px; overflow: hidden; }
+  .step.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+  .step-head { padding: 8px 12px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; cursor: pointer; }
+  .step-id { color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .step-name { font-weight: 600; }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); }
+  .loc { min-width: 0; overflow-wrap: anywhere; color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; margin-left: auto; }
+  .ext { overflow-wrap: anywhere; padding: 0 12px 8px; color: var(--muted); font-size: 12px; }
+  pre { tab-size: 2; margin: 0; padding: 10px 12px; background: var(--code-bg); border-top: 1px solid var(--border); overflow-x: auto; font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .unresolved { color: var(--warn); }
+  .error { padding: 20px; color: var(--warn); white-space: pre-wrap; font-family: ui-monospace, monospace; }
+  @media (max-width: 800px) {
+    main { grid-template-columns: minmax(0, 1fr); height: auto; }
+    #diagram { border-right: 0; border-bottom: 1px solid var(--border); max-height: 70vh; padding: 16px; }
+    #steps { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Call flow</h1>
+  <span class="meta" id="meta"></span>
+  <a href="" title="Re-run against the current code">Reload</a>
+</header>
+<main>
+  <section id="diagram" aria-label="Flow diagram"></section>
+  <section id="steps" aria-label="Steps"></section>
+</main>
+<script src="/mermaid.js"></script>
+<script>
+const DATA = /*DATA*/null;
+
+const $ = (sel) => document.querySelector(sel);
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+};
+
+function focusStep(id, fromDiagram) {
+  document.querySelectorAll(".step.active, #diagram .node.active").forEach((e) => e.classList.remove("active"));
+  const card = document.getElementById(`step-${id}`);
+  card?.classList.add("active");
+  if (fromDiagram) card?.scrollIntoView({ behavior: "smooth", block: "start" });
+  const node = [...document.querySelectorAll("#diagram .node")].find((n) => n.id.split("-").includes(id));
+  node?.classList.add("active");
+  if (!fromDiagram) node?.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+}
+window.focusStep = (id) => focusStep(id, true);
+
+async function render() {
+  document.title = DATA.title;
+  $("#title").textContent = DATA.title;
+  const meta = [`entry ${DATA.entry}`, `${DATA.steps.length} steps`, `depth ${DATA.depth}`];
+  if (DATA.truncated) meta.push(`stopped at ${DATA.maxNodes} steps`);
+  $("#meta").textContent = meta.join(" · ");
+
+  const steps = $("#steps");
+  for (const s of DATA.steps) {
+    const card = el("article", "step");
+    card.id = `step-${s.id}`;
+    const head = el("div", "step-head");
+    head.append(el("span", "step-id", s.id), el("span", "step-name", s.name));
+    if (s.abstract) head.append(el("span", "tag", "interface"));
+    if (s.unexpanded) head.append(el("span", "tag", "not expanded"));
+    head.append(el("span", "loc", s.location));
+    head.onclick = () => focusStep(s.id, false);
+    card.append(head);
+    if (s.externals.length) card.append(el("div", "ext", `library calls: ${s.externals.join(", ")}`));
+    card.append(el("pre", null, s.code));
+    steps.append(card);
+  }
+  if (DATA.unresolved.length) {
+    const card = el("article", "step");
+    card.append(el("div", "step-head unresolved", "Unresolved calls (no declaration known to the checker)"));
+    card.append(el("pre", null, DATA.unresolved.map((u) => `${u.location}  ${u.text}`).join("\n")));
+    steps.append(card);
+  }
+
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  mermaid.initialize({ startOnLoad: false, securityLevel: "loose", theme: dark ? "dark" : "default", flowchart: { htmlLabels: true, useMaxWidth: false } });
+  const src = DATA.mermaid + "\n" + DATA.steps.map((s) => `  click ${s.id} call focusStep("${s.id}")`).join("\n");
+  const { svg, bindFunctions } = await mermaid.render("flow", src);
+  $("#diagram").innerHTML = svg;
+  bindFunctions?.($("#diagram"));
+  const d = $("#diagram");
+  d.scrollLeft = (d.scrollWidth - d.clientWidth) / 2; // the entry node sits in the middle
+}
+
+render().catch((e) => {
+  $("#diagram").replaceChildren(el("div", "error", String(e?.message ?? e)));
+});
+</script>
+</body>
+</html>
