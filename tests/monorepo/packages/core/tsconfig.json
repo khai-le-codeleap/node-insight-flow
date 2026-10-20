@@ -1,0 +1,4 @@
+{
+  "compilerOptions": { "composite": true, "strict": true, "target": "es2022", "module": "esnext", "moduleResolution": "bundler", "outDir": "dist" },
+  "include": ["src"]
+}

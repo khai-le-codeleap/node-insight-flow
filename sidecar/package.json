@@ -1,0 +1,7 @@
+{
+  "name": "project-mcp-sidecar",
+  "private": true,
+  "dependencies": {
+    "typescript": "6.0.3"
+  }
+}

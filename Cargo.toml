@@ -1,0 +1,9 @@
+[package]
+name = "project-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ignore = "0.4.33"
+regex = "1.13.1"
+serde_json = "1.0.154"
