@@ -849,6 +849,7 @@ function containerOf(site, p, keep) {
             line: pos.line + 1,
             column: pos.character + 1,
             fn: !!unitFromDecl(d)?.body,
+            in: callSummary(n, viaReceiver), // the wrapping call it is passed into
             code: codeAround(statementOf(d), dn.getStart(), 15),
           });
         }

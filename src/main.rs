@@ -778,6 +778,9 @@ mod tests {
         };
         let page = get("/flow?symbol=handle&file=src/flow.ts", &format!("127.0.0.1:{port}"));
         assert!(page.starts_with("HTTP/1.1 200") && page.contains("\"name\":\"memRepo.find\""), "{}", &page[..page.len().min(400)]);
+        // A drilled-into flow carries the API it started from; the server ignores those params.
+        let sub = get("/flow?file=src/flow.ts&line=9&column=10&root=symbol%3Dhandle&rootName=handle", &format!("127.0.0.1:{port}"));
+        assert!(sub.starts_with("HTTP/1.1 200") && sub.contains("flow of lookup"), "{}", &sub[..sub.len().min(300)]);
         assert!(get("/mermaid.js", &format!("localhost:{port}")).starts_with("HTTP/1.1 200"));
         assert!(get("/flow?symbol=handle", "evil.example:80").starts_with("HTTP/1.1 403"));
     }
