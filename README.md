@@ -1,4 +1,4 @@
-# project-mcp
+# node-insight-flow
 
 MCP server (stdio) written in Rust. It adds what Claude Code's built-in Grep/Glob/Read can't do well:
 semantic TypeScript navigation (like VSCode), section-level Markdown reading, and log summaries.
@@ -15,7 +15,7 @@ cargo build --release
 ## Use with Claude Code
 
 ```sh
-claude mcp add --scope user project -- /path/to/project-mcp/target/release/project-mcp
+claude mcp add --scope user node-insight-flow -- /path/to/node-insight-flow/target/release/node-insight-flow
 ```
 
 The project root is the first argument, or the current directory (where `claude` runs). All paths are relative to it; paths escaping it are rejected.
@@ -35,6 +35,7 @@ The binary loads `sidecar/ts.cjs` from this repo, so keep the repo where it was 
 | `rename_preview` | Every `-old/+new` line a rename would produce; writes nothing |
 | `diagnostics` | Type errors for a file or directory (`maxResults`) |
 | `call_flow` | Control-flow chart of a function / API handler (Mermaid) plus the code of every function it calls. Built from the syntax tree and the type checker: calls resolved with `getResolvedSignature`, interface/service members followed to their implementation, unresolvable calls listed separately. Entry is the handler (`symbol`, or `file` + `line` inside an inline handler). The result starts with a `http://127.0.0.1:<port>/flow?…` link to an interactive page |
+| `list_apis` | HTTP APIs in the backend: method, full path, handler `file:line:column` (ready for `call_flow`). Finds `app.get("/x", mw, h)`-style routes (a call named after an HTTP method with a `/path` and a function after it; client calls like `axios.get("/x")` have none and are skipped), named endpoints `X.get("name", "/x")` whose handler is wherever the type checker links the name literal (e.g. Effect `.handle("name", h)`), `@Get("/x")` under `@Controller("/p")`, and `GET`/`POST` exports of `route.ts`/`+server.ts`. Prefixes from `.prefix("/p")`/`.basePath("/p")` wrapped around the declaration are added; prefixes from mounting (`app.use("/api", router)`) and config-object routes are not |
 | `ts_projects` | tsconfig projects found, file counts, TS version |
 | `ts_reload` | Rebuild all TS projects from scratch |
 

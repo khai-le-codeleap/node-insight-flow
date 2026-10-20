@@ -1,5 +1,5 @@
 {
-  "name": "project-mcp-sidecar",
+  "name": "node-insight-flow-sidecar",
   "private": true,
   "dependencies": {
     "mermaid": "11",

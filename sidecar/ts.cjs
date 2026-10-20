@@ -1,4 +1,4 @@
-// project-mcp sidecar: TypeScript LanguageService over newline-delimited JSON on stdio.
+// node-insight-flow sidecar: TypeScript LanguageService over newline-delimited JSON on stdio.
 // Request: {"id", "tool", "args"}  Reply: {"id", "text"} | {"id", "error"}
 // Monorepos: one LanguageService per tsconfig (built lazily, freed when idle); a file belongs to the
 // deepest tsconfig that includes it; references/rename/callers are merged across every project that sees the file.
@@ -969,6 +969,135 @@ function callFlow(project, entry, a) {
 // ---------- tools ----------
 
 /** Wrap a tool that needs a position. */
+// ---------- list_apis ----------
+// HTTP APIs declared in the project, found from the syntax tree without framework knowledge:
+//   calls named after an HTTP method with a path ("/…"): `app.get("/x", auth, h)` (route + handler) or
+//   `HttpApiEndpoint.get("name", "/x")` (named endpoint; its handler is found by references to the name literal,
+//   which the checker links to e.g. `.handle("name", h)`); `@Get("/x")` decorators under `@Controller("/p")`;
+//   `export function GET` in file-routed `route.ts` / `+server.ts`.
+
+const HTTP = ["get", "post", "put", "patch", "delete", "del", "head", "options", "all"];
+const strOf = (n) => (n && (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) ? n.text : null);
+const calleeName = (call) =>
+  ts.isPropertyAccessExpression(call.expression) ? call.expression.name.text : ts.isIdentifier(call.expression) ? call.expression.text : null;
+const callable = (checker, n) => isFn(n) || ((ts.isIdentifier(n) || ts.isPropertyAccessExpression(n)) && checker.getTypeAtLocation(n).getCallSignatures().length > 0);
+
+/** `X.prefix("/p")` / `X.basePath("/p")` wrapped around the node, outermost first. */
+function prefixOf(n) {
+  let pre = "";
+  for (; n.parent; n = n.parent) {
+    const pa = n.parent;
+    if (ts.isPropertyAccessExpression(pa) && pa.expression === n && ["prefix", "basePath"].includes(pa.name.text) && ts.isCallExpression(pa.parent)) {
+      const s = strOf(pa.parent.arguments[0]);
+      if (s) pre = s.replace(/\/$/, "") + pre;
+    }
+  }
+  return pre;
+}
+
+/** Where a handler argument lives: inline → itself, identifier → its declaration. */
+function handlerAt(checker, n) {
+  if (!isFn(n)) {
+    let sym = checker.getSymbolAtLocation(ts.isPropertyAccessExpression(n) ? n.name : n);
+    if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
+    const d = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (d && inProject(d.getSourceFile().fileName)) return { name: n.getText(), ...at(d.getSourceFile().fileName, d.getStart()) };
+  }
+  const sf = n.getSourceFile();
+  return { name: isFn(n) ? "inline" : n.getText(), ...at(sf.fileName, n.getStart()), column: sf.getLineAndCharacterOfPosition(n.getStart()).character + 1 };
+}
+
+function listApis(a) {
+  const under = abs(a.path || ".");
+  const tests = !!a.includeTests;
+  const apis = [];
+  const seen = new Set();
+  for (const p of active()) {
+    const checker = p.program.getTypeChecker();
+    for (const f of p.fileNames) {
+      if (seen.has(f) || !inProject(f) || (!tests && TEST_FILE.test(f)) || !(f === under || f.startsWith(under + path.sep))) continue;
+      seen.add(f);
+      const sf = p.program.getSourceFile(f);
+      if (!sf) continue;
+      const fileRouted = /(^|\/)(route|\+server)\.[cm]?[jt]sx?$/.test(f);
+      const visit = (n) => {
+        if (ts.isCallExpression(n)) {
+          const m = calleeName(n);
+          const args = n.arguments;
+          if (m && HTTP.includes(m)) {
+            const i = [0, 1].find((k) => strOf(args[k])?.startsWith("/"));
+            if (i === 1 && strOf(args[0]) != null) {
+              apis.push({ method: m, path: prefixOf(n) + strOf(args[1]), name: strOf(args[0]), decl: at(f, n.getStart()), nameNode: args[0], project: p });
+            } else if (i === 0) {
+              const fns = args.slice(1).filter((x) => callable(checker, x));
+              // no function after the path: a client call (`axios.get("/x")`), not a route
+              if (fns.length) {
+                apis.push({
+                  method: m, path: prefixOf(n) + strOf(args[0]), decl: at(f, n.getStart()),
+                  handlers: [handlerAt(checker, fns.at(-1))], via: fns.slice(0, -1).map((x) => x.getText()),
+                });
+              }
+            }
+          }
+        }
+        if (ts.isMethodDeclaration(n)) {
+          for (const d of ts.canHaveDecorators(n) ? ts.getDecorators(n) ?? [] : []) {
+            if (!ts.isCallExpression(d.expression)) continue;
+            const m = calleeName(d.expression)?.toLowerCase();
+            if (!m || !HTTP.includes(m)) continue;
+            const cls = n.parent;
+            const ctl = (ts.canHaveDecorators(cls) ? ts.getDecorators(cls) ?? [] : []).find((x) => ts.isCallExpression(x.expression) && /Controller$/.test(calleeName(x.expression) ?? ""));
+            const pre = (ctl && strOf(ctl.expression.arguments[0])) ?? "";
+            const sub = strOf(d.expression.arguments[0]) ?? "";
+            const full = ("/" + [pre, sub].map((x) => x.replace(/^\/|\/$/g, "")).filter(Boolean).join("/"));
+            apis.push({ method: m, path: full, decl: at(f, d.getStart()), handlers: [{ name: `${cls.name?.text ?? "class"}.${n.name.getText()}`, ...at(f, n.name.getStart()) }] });
+          }
+        }
+        ts.forEachChild(n, visit);
+      };
+      visit(sf);
+      if (fileRouted) {
+        // shortcut: path is the folder under the nearest app/ or routes/ dir, route groups "(x)" dropped; dynamic segments kept as written
+        const dir = path.dirname(rel(f)).split(path.sep);
+        const base = Math.max(dir.lastIndexOf("app"), dir.lastIndexOf("routes"));
+        const route = "/" + dir.slice(base + 1).filter((x) => !/^\(.*\)$/.test(x)).join("/");
+        for (const st of sf.statements) {
+          const exported = ts.getCombinedModifierFlags(st) & ts.ModifierFlags.Export;
+          const names = ts.isFunctionDeclaration(st) ? [st.name] : ts.isVariableStatement(st) ? st.declarationList.declarations.map((d) => d.name) : [];
+          for (const nm of names) {
+            if (exported && nm && ts.isIdentifier(nm) && HTTP.includes(nm.text.toLowerCase()) && nm.text === nm.text.toUpperCase()) {
+              apis.push({ method: nm.text.toLowerCase(), path: route, decl: at(f, nm.getStart()), handlers: [{ name: nm.text, ...at(f, nm.getStart()) }] });
+            }
+          }
+        }
+      }
+    }
+  }
+  // named endpoints: the handlers are wherever the checker says the name literal is used as a call's first argument
+  for (const e of apis.filter((x) => x.nameNode)) {
+    const f = e.nameNode.getSourceFile().fileName;
+    const hs = new Map();
+    for (const sp of seers(f)) {
+      const checker = sp.program.getTypeChecker();
+      for (const g of sp.service.findReferences(f, e.nameNode.getStart() + 1) ?? []) {
+        for (const r of g.references) {
+          if ((!tests && TEST_FILE.test(r.fileName)) || !inProject(r.fileName)) continue;
+          const lit = nodeAt(sp.program.getSourceFile(r.fileName), r.textSpan.start);
+          const call = lit?.parent;
+          if (!call || !ts.isCallExpression(call) || call.arguments[0] !== lit) continue;
+          const fn = call.arguments.slice(1).filter((x) => callable(checker, x)).at(-1);
+          if (fn) {
+            const h = handlerAt(checker, fn);
+            hs.set(`${h.file}:${h.line}`, h);
+          }
+        }
+      }
+    }
+    e.handlers = [...hs.values()];
+  }
+  return apis;
+}
+
 const positional = (fn) => (a) => {
   const l = locate(a);
   return l.ambiguous ? ambiguous(a.symbol, l.ambiguous) : fn(l, a);
@@ -1120,6 +1249,22 @@ const tools = {
     if (!entry || !entry.body) throw new Error("no function at that position; point at a function, method or inline handler");
     return callFlow(project, entry, a);
   }),
+
+  list_apis(a) {
+    const apis = listApis(a).sort((x, y) => x.path.localeCompare(y.path) || x.method.localeCompare(y.method));
+    if (!apis.length) return "no HTTP APIs found (looked for app.get(\"/x\", h), Endpoint.get(\"name\", \"/x\"), @Get(\"/x\"), route.ts exports)";
+    const w = Math.max(...apis.map((x) => x.path.length));
+    const out = [`${apis.length} APIs  (handler file:line[:column] → call_flow file, line, column)`];
+    for (const x of apis) {
+      out.push(`${x.method.toUpperCase().padEnd(7)} ${x.path.padEnd(w)}${x.name ? `  [${x.name}]` : ""}${x.via?.length ? `  via ${x.via.join(", ")}` : ""}`);
+      if (!x.handlers.length) out.push(`          no handler in this project (a client of another service?)  declared ${rel(x.decl.file)}:${x.decl.line}`);
+      for (const h of x.handlers) {
+        out.push(`          handler: ${rel(h.file)}:${h.line}${h.column ? `:${h.column}` : ""}  ${h.text}`);
+      }
+      if (x.handlers.every((h) => h.file !== x.decl.file || h.line !== x.decl.line) && x.handlers.length) out.push(`          declared: ${rel(x.decl.file)}:${x.decl.line}`);
+    }
+    return out.join("\n");
+  },
 
   ts_reload() {
     for (const p of projects.values()) {

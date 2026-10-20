@@ -1,4 +1,4 @@
-//! project-mcp: MCP server (stdio, newline-delimited JSON-RPC) for exploring a project.
+//! node-insight-flow: MCP server (stdio, newline-delimited JSON-RPC) for exploring a project.
 //! Semantic TS/JS tools are served by a Bun sidecar (sidecar/ts.cjs) running TypeScript's LanguageService.
 //! `call_flow` pages are served over HTTP on 127.0.0.1 by this same process.
 use std::collections::{BTreeMap, HashMap};
@@ -22,7 +22,7 @@ const FLOW_HTML: &str = include_str!("flow.html");
 
 /// The sidecar, shared by the stdio loop and the HTTP thread.
 type Ts = Arc<Mutex<Option<Sidecar>>>;
-const SEMANTIC: &[&str] = &["go_to_definition", "find_references", "incoming_calls", "type_info", "rename_preview", "diagnostics", "ts_projects", "ts_reload", "call_flow"];
+const SEMANTIC: &[&str] = &["go_to_definition", "find_references", "incoming_calls", "type_info", "rename_preview", "diagnostics", "ts_projects", "ts_reload", "call_flow", "list_apis"];
 
 fn main() {
     let root = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap());
@@ -57,7 +57,7 @@ fn main() {
                 json!({
                 "protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "project-mcp", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "node-insight-flow", "version": env!("CARGO_PKG_VERSION")},
                 })
             }
             "ping" => json!({}),
@@ -121,6 +121,12 @@ Entry: the handler's `symbol`, or `file` + `line` anywhere inside an inline hand
                 "maxLines": {"type": "integer", "description": "Code lines shown per called function (default 60)"},
                 "includeTests": {"type": "boolean", "description": "Also show calls into test/mock files (default false)"},
             })), &[]),
+        tool("list_apis", "HTTP APIs declared in the project: method, path (with `.prefix()`/`.basePath()`/`@Controller` prefixes) and \
+handler location, ready for call_flow. Found from the syntax tree and the type checker, no framework list: calls named after an HTTP \
+method with a \"/path\" plus a handler (`app.get(\"/x\", auth, h)`), named endpoints (`Endpoint.get(\"name\", \"/x\")`, handler = where \
+the checker links the name, e.g. `.handle(\"name\", h)`), `@Get(\"/x\")` decorators, and `GET`/`POST` exports of `route.ts` / `+server.ts`. \
+Not covered: prefixes added by mounting (`app.use(\"/api\", router)`), config-object routes (`route({ method, url })`).",
+            json!({"path": path, "includeTests": {"type": "boolean", "description": "Also scan test files (default false)"}}), &[]),
         tool("ts_projects", "List the tsconfig projects found (monorepo packages), their file counts and the TypeScript version in use.", json!({}), &[]),
         tool("ts_reload", "Rebuild all TypeScript projects from scratch. Only needed if results look stale after changing packages in a way that touched no lockfile, package.json or node_modules entry.", json!({}), &[]),
     ])
@@ -137,7 +143,7 @@ fn call(root: &Path, ts: &Ts, web: &mut Option<u16>, params: &Value) -> Value {
         "summarize_log" => summarize_log(root, a),
         "call_flow" => semantic(root, &mut lock(ts), "call_flow", a).map(|text| {
             if web.is_none() {
-                *web = start_web(root.to_path_buf(), ts.clone()).map_err(|e| eprintln!("project-mcp: HTTP server: {e}")).ok();
+                *web = start_web(root.to_path_buf(), ts.clone()).map_err(|e| eprintln!("node-insight-flow: HTTP server: {e}")).ok();
             }
             match web {
                 Some(port) => format!("open in browser: {}\n\n{text}", flow_url(*port, a)),
@@ -224,7 +230,7 @@ fn start_web(root: PathBuf, ts: Ts) -> io::Result<u16> {
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             if let Err(e) = serve(&root, &ts, port, stream) {
-                eprintln!("project-mcp: HTTP: {e}");
+                eprintln!("node-insight-flow: HTTP: {e}");
             }
         }
     });
@@ -591,7 +597,7 @@ mod tests {
     #[test]
     fn ts_references_are_semantic_and_fresh() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
-        let root = std::env::temp_dir().join(format!("project-mcp-fixture-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("node-insight-flow-fixture-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         copy_dir(&src, &root);
         let root = root.canonicalize().unwrap();
@@ -628,7 +634,7 @@ mod tests {
 
     #[test]
     fn ts_installing_a_package_clears_stale_resolution() {
-        let root = std::env::temp_dir().join(format!("project-mcp-install-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("node-insight-flow-install-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture"), &root);
         std::fs::write(root.join("src/pkg.ts"), "import { x } from \"fake-pkg\";\nexport const y: number = x;\n").unwrap();
@@ -648,7 +654,7 @@ mod tests {
 
     #[test]
     fn ts_extends_base_config_change_is_seen() {
-        let root = std::env::temp_dir().join(format!("project-mcp-extends-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("node-insight-flow-extends-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture"), &root);
         std::fs::write(root.join("tsconfig.base.json"), r#"{"compilerOptions": {"noImplicitAny": false}}"#).unwrap();
@@ -726,6 +732,28 @@ mod tests {
         // Entry by line inside the function also works.
         let by_line = semantic(&root, &mut ts, "call_flow", &json!({"file": "src/flow.ts", "line": 21})).unwrap();
         assert!(by_line.contains("([\"handle"), "{by_line}");
+    }
+
+    #[test]
+    fn ts_list_apis_finds_routes_endpoints_and_decorators() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture").canonicalize().unwrap();
+        let mut ts = None;
+        let out = semantic(&root, &mut ts, "list_apis", &json!({})).unwrap();
+        let block = |head: &str| {
+            let i = out.find(head).unwrap_or_else(|| panic!("no {head} in\n{out}"));
+            out[i..].lines().take(3).collect::<Vec<_>>().join("\n")
+        };
+        // route + handler, middleware in between
+        let users = block("GET     /users ");
+        assert!(users.contains("via requireUser") && users.contains("handler: src/routes.ts:6"), "{users}");
+        // named endpoint under .prefix(): handler found through the checker's references to "getUser"
+        let get_user = block("GET     /v1/users/:id");
+        assert!(get_user.contains("[getUser]") && get_user.contains("handler: src/routes.ts:18:28") && get_user.contains("declared: src/routes.ts:16"), "{get_user}");
+        // @Controller("/admin") + @Post("reset")
+        assert!(block("POST    /admin/reset").contains("handler: src/routes.ts:25"), "{out}");
+        assert!(out.contains("/profile"), "{out}");
+        // a client call has no handler after the path
+        assert!(!out.contains("/not-a-route"), "{out}");
     }
 
     #[test]

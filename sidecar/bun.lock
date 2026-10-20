@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "project-mcp-sidecar",
+      "name": "node-insight-flow-sidecar",
       "dependencies": {
         "mermaid": "11",
         "typescript": "6.0.3",
