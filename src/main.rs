@@ -24,7 +24,8 @@ type Ts = Arc<Mutex<Option<Sidecar>>>;
 const SEMANTIC: &[&str] = &["go_to_definition", "find_references", "incoming_calls", "type_info", "rename_preview", "diagnostics", "ts_projects", "ts_reload", "call_flow", "list_apis"];
 
 fn main() {
-    let root = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap());
+    // A client that doesn't expand `${workspaceFolder}` (or passes a stale path) falls back to the working directory.
+    let root = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(|| std::env::current_dir().unwrap());
     let root = root.canonicalize().unwrap_or_else(|e| panic!("invalid root {}: {e}", root.display()));
     // Started on initialize or the first semantic call, then kept for the session.
     let ts: Ts = Arc::new(Mutex::new(None));

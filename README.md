@@ -11,7 +11,18 @@ Requires [Bun](https://bun.sh) at runtime (it runs the TypeScript sidecar). macO
 curl -fsSL https://raw.githubusercontent.com/khai-le-codeleap/node-insight-flow/main/install.sh | sh
 ```
 
-It downloads the latest release into `~/.node-insight-flow` (override with `NODE_INSIGHT_FLOW_DIR`) and, if `claude` is on your PATH, registers it at user scope. Or download an archive from [Releases](https://github.com/khai-le-codeleap/node-insight-flow/releases), extract it anywhere and run `claude mcp add --scope user node-insight-flow -- /path/to/node-insight-flow/node-insight-flow`. Keep the `sidecar/` folder next to the binary.
+It downloads the latest release into `~/.node-insight-flow` (override with `NODE_INSIGHT_FLOW_DIR`) and registers it with every client it finds: Claude Code (`claude`), Codex (`codex`), VS Code / GitHub Copilot (`code`, `code-insiders`) and Cursor (`~/.cursor`). Or download an archive from [Releases](https://github.com/khai-le-codeleap/node-insight-flow/releases) and extract it anywhere; keep the `sidecar/` folder next to the binary.
+
+Manual setup (`BIN` = path to the `node-insight-flow` binary). The project root is the first argument, else the working directory; an argument that isn't a directory (e.g. an unexpanded `${workspaceFolder}`) falls back to the working directory.
+
+| Client | Setup |
+|---|---|
+| Claude Code | `claude mcp add --scope user node-insight-flow -- BIN` |
+| Codex | `codex mcp add node-insight-flow -- BIN`, or in `~/.codex/config.toml`: `[mcp_servers.node-insight-flow]` `command = "BIN"` |
+| VS Code / GitHub Copilot (agent mode) | `code --add-mcp '{"name":"node-insight-flow","type":"stdio","command":"BIN","args":["${workspaceFolder}"]}'`, or `.vscode/mcp.json`: `{"servers": {"node-insight-flow": {"type": "stdio", "command": "BIN", "args": ["${workspaceFolder}"]}}}` |
+| Cursor | `~/.cursor/mcp.json` (or `.cursor/mcp.json` in the project): `{"mcpServers": {"node-insight-flow": {"command": "BIN", "args": ["${workspaceFolder}"]}}}` |
+
+Claude Code and Codex start the server in the project directory; VS Code and Cursor don't, hence `${workspaceFolder}`.
 
 Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed.
 
