@@ -64,10 +64,14 @@
   #tree { flex: 1; overflow: auto; position: relative; padding: 6px 0; }
   #tree svg.arrows { position: absolute; left: 0; top: 6px; overflow: visible; pointer-events: none; }
   #tree svg.arrows path { fill: none; stroke-width: 1.5; pointer-events: stroke; cursor: default; }
-  #tree svg.arrows path.calls { stroke: var(--accent); }
+  #tree svg.arrows path.main { stroke: var(--accent); stroke-width: 3; }
+  #tree svg.arrows path.calls { stroke: var(--accent); stroke-width: 1.2; opacity: .75; }
+  #tree svg.arrows .station { fill: var(--accent); }
+  #tree svg.arrows .station-n { fill: var(--panel); font: 600 9px system-ui, sans-serif; text-anchor: middle; }
+  .row.on-main .name { font-weight: 600; }
   #tree svg.arrows path.wraps { stroke: var(--muted); stroke-dasharray: 5 3; }
   #tree svg.arrows path.uses { stroke: var(--warn); stroke-dasharray: 1 3; stroke-linecap: round; }
-  #tree.selecting svg.arrows path { opacity: .15; }
+  #tree.selecting svg.arrows path:not(.main) { opacity: .12; }
   #tree.selecting svg.arrows path.hot { opacity: 1; stroke-width: 2.5; }
   .row { height: 26px; display: flex; align-items: center; gap: 6px; padding-right: 10px; white-space: nowrap; cursor: pointer; font-size: 13px; }
   .row:hover { background: var(--btn); }
@@ -112,9 +116,10 @@
   <aside id="files" aria-label="Files in this flow">
     <div class="side-head"><strong id="files-title">Files</strong><button id="files-close" aria-label="Close file tree">✕</button></div>
     <div class="files-legend" aria-label="Arrow legend">
-      <span><svg width="22" height="8"><path d="M1 4H21" stroke="var(--accent)" stroke-width="1.5"/></svg> calls into</span>
-      <span><svg width="22" height="8"><path d="M1 4H21" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="5 3"/></svg> wraps / registers</span>
-      <span><svg width="22" height="8"><path d="M1 4H21" stroke="var(--warn)" stroke-width="1.5" stroke-dasharray="1 3" stroke-linecap="round"/></svg> passes a value from</span>
+      <span><svg width="26" height="14"><path d="M1 7H17" stroke="var(--accent)" stroke-width="3"/><circle cx="21" cy="7" r="5" fill="var(--accent)"/></svg> main path: how a request gets to the handler, in order</span>
+      <span><svg width="22" height="8"><path d="M1 4H21" stroke="var(--accent)" stroke-width="1.2"/></svg> calls into</span>
+      <span><svg width="22" height="8"><path d="M1 4H21" stroke="var(--warn)" stroke-width="1.5" stroke-dasharray="1 3" stroke-linecap="round"/></svg> passes a value from (e.g. middleware)</span>
+      <span><svg width="22" height="8"><path d="M1 4H21" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="5 3"/></svg> other registration</span>
     </div>
     <div id="tree" role="tree"></div>
   </aside>
@@ -248,10 +253,20 @@ function fileGraph() {
     for (const v of r.args) add(rFile[r.id], v.file, "uses");
   }
   for (const n of DATA.nodes) for (const c of n.callees) add(fileOf(n.location), c.file, "calls");
+
+  // Main path: the longest reached-from chain, outermost first, ending at the entry's file.
+  const chain = (id, seen = new Set()) =>
+    id === "c0" || seen.has(id) ? [] : [id, ...chain(DATA.reachedFrom.find((r) => r.id === id).edges[0].to, seen.add(id))];
+  const roots = DATA.reachedFrom.filter((r) => !DATA.reachedFrom.some((x) => x.edges.some((e) => e.to === r.id)));
+  const longest = roots.map((r) => chain(r.id)).sort((a, b) => b.length - a.length)[0] ?? [];
+  const main = [];
+  for (const f of [...longest.map((id) => rFile[id]), entryFile]) if (main.at(-1) !== f) main.push(f);
   // boxes in the diagram per file
   const boxes = {};
   for (const n of [...DATA.nodes, ...DATA.reachedFrom]) (boxes[fileOf(n.location)] ??= []).push(n.id);
-  return { entryFile, files: [...files].sort(), edges: [...edges.values()], boxes };
+  // Wraps edges along the main path are the path itself, not branches.
+  const onMain = (e) => e.kind === "wraps" && main.some((f, i) => f === e.from && main[i + 1] === e.to);
+  return { entryFile, main, files: [...files].sort(), edges: [...edges.values()].filter((e) => !onMain(e)), boxes };
 }
 
 function buildTree(files) {
@@ -302,20 +317,11 @@ function drawTree() {
   };
   walk(g.tree, 0, null);
 
-  // Lanes: shortest spans nearest the names, an edge takes the first lane free over its span.
-  const edges = g.edges
-    .map((e) => ({ ...e, a: rowOf[e.from], b: rowOf[e.to] }))
-    .filter((e) => e.a != null && e.b != null && e.a !== e.b)
-    .sort((x, y) => Math.abs(x.a - x.b) - Math.abs(y.a - y.b));
-  const lanes = [];
-  for (const e of edges) {
-    const lo = Math.min(e.a, e.b), hi = Math.max(e.a, e.b);
-    let l = lanes.findIndex((used) => used.every(([u, v]) => hi < u || lo > v));
-    if (l < 0) { lanes.push([]); l = lanes.length - 1; }
-    lanes[l].push([lo, hi]);
-    e.lane = l;
-  }
-  const gutter = 18 + lanes.length * 7;
+  // One trunk (the main path) at x = TRUNK; every other arrow branches off the trunk at its source's station.
+  const TRUNK = 14;
+  const gutter = 44;
+  const yOf = (row) => row * ROW + ROW / 2;
+  const stations = g.main.map((f) => rowOf[f]).filter((r) => r != null);
 
   const NS = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(NS, "svg");
@@ -323,9 +329,9 @@ function drawTree() {
   svg.setAttribute("width", gutter);
   svg.setAttribute("height", rows.length * ROW);
   const defs = document.createElementNS(NS, "defs");
-  for (const [kind, color] of [["calls", "var(--accent)"], ["wraps", "var(--muted)"], ["uses", "var(--warn)"]]) {
+  for (const [kind, color] of [["main", "var(--accent)"], ["calls", "var(--accent)"], ["wraps", "var(--muted)"], ["uses", "var(--warn)"]]) {
     const m = document.createElementNS(NS, "marker");
-    Object.entries({ id: `arrow-${kind}`, viewBox: "0 0 8 8", refX: 7, refY: 4, markerWidth: 7, markerHeight: 7, orient: "auto" }).forEach(([k, v]) => m.setAttribute(k, v));
+    Object.entries({ id: `arrow-${kind}`, viewBox: "0 0 8 8", refX: 7, refY: 4, markerWidth: 6, markerHeight: 6, orient: "auto" }).forEach(([k, v]) => m.setAttribute(k, v));
     const tip = document.createElementNS(NS, "path");
     tip.setAttribute("d", "M0 0L8 4L0 8z");
     tip.style.fill = color;
@@ -333,21 +339,48 @@ function drawTree() {
     defs.append(m);
   }
   svg.append(defs);
-  for (const e of edges) {
-    const y1 = e.a * ROW + ROW / 2, y2 = e.b * ROW + ROW / 2;
-    const xr = gutter - 3, xl = gutter - 12 - e.lane * 7;
-    const path = document.createElementNS(NS, "path");
-    path.setAttribute("d", `M${xr} ${y1} C${xl} ${y1} ${xl} ${y2} ${xr} ${y2}`);
-    path.setAttribute("marker-end", `url(#arrow-${e.kind})`);
-    path.classList.add(e.kind);
-    path.dataset.from = e.from;
-    path.dataset.to = e.to;
-    const verb = { calls: "calls into", wraps: "wraps / registers", uses: "passes a value from" }[e.kind];
-    const title = document.createElementNS(NS, "title");
-    title.textContent = `${e.from} ${verb} ${e.to}${e.n > 1 ? ` (×${e.n})` : ""}`;
-    path.append(title);
-    svg.append(path);
+  const line = (d, cls, marker, tip) => {
+    const p = document.createElementNS(NS, "path");
+    p.setAttribute("d", d);
+    p.setAttribute("class", cls);
+    if (marker) p.setAttribute("marker-end", `url(#arrow-${marker})`);
+    const t = document.createElementNS(NS, "title");
+    t.textContent = tip;
+    p.append(t);
+    svg.append(p);
+    return p;
+  };
+
+  // trunk: station to station, the arrow ending just before the next station's dot
+  for (let i = 0; i + 1 < stations.length; i++) {
+    const a = stations[i], b = stations[i + 1];
+    if (a === b) continue;
+    const dir = Math.sign(b - a);
+    const p = line(`M${TRUNK} ${yOf(a) + dir * 8} V${yOf(b) - dir * 9}`, "main", "main", `${i + 1} → ${i + 2}: ${g.main[i]} → ${g.main[i + 1]}`);
+    p.dataset.from = g.main[i];
+    p.dataset.to = g.main[i + 1];
   }
+  // branches: leave the trunk at the source station, curve into the target row
+  const verb = { calls: "calls into", wraps: "wraps / registers", uses: "passes a value from" };
+  for (const e of g.edges) {
+    const a = rowOf[e.from], b = rowOf[e.to];
+    if (a == null || b == null || a === b) continue;
+    const x0 = TRUNK + (g.main.includes(e.from) ? 7 : 0);
+    const p = line(`M${x0} ${yOf(a)} C${gutter - 14} ${yOf(a)} ${gutter - 22} ${yOf(b)} ${gutter - 3} ${yOf(b)}`, e.kind, e.kind, `${e.from} ${verb[e.kind]} ${e.to}${e.n > 1 ? ` (×${e.n})` : ""}`);
+    p.dataset.from = e.from;
+    p.dataset.to = e.to;
+  }
+  // stations last so they sit on top
+  g.main.forEach((f, i) => {
+    const r = rowOf[f];
+    if (r == null) return;
+    const c = document.createElementNS(NS, "circle");
+    Object.entries({ cx: TRUNK, cy: yOf(r), r: 7, class: "station" }).forEach(([k, v]) => c.setAttribute(k, v));
+    const n = document.createElementNS(NS, "text");
+    Object.entries({ x: TRUNK, y: yOf(r) + 3, class: "station-n" }).forEach(([k, v]) => n.setAttribute(k, v));
+    n.textContent = String(i + 1);
+    svg.append(c, n);
+  });
   tree.append(svg);
 
   for (const r of rows) {
@@ -366,6 +399,7 @@ function drawTree() {
     } else {
       row.dataset.file = r.key;
       if (r.key === g.entryFile) row.classList.add("entry");
+      if (g.main.includes(r.key)) row.classList.add("on-main");
       if (r.key === graph.selected) row.classList.add("selected");
       row.append(el("span", "caret", ""), el("span", "name", r.name));
       const n = g.boxes[r.key]?.length;
