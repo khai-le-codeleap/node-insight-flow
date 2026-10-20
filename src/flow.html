@@ -69,7 +69,10 @@
   .section { margin: 14px 2px 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
   #files { flex: none; width: 340px; border-right: 1px solid var(--border); background: var(--bg); display: flex; flex-direction: column; min-width: 0; }
   #files[hidden] { display: none; }
-  .files-legend { flex: none; display: flex; flex-direction: column; gap: 4px; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+  .files-legend { flex: none; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+  .files-legend[open] { padding-bottom: 8px; }
+  .files-legend summary { cursor: pointer; font-size: 12px; color: var(--text); padding: 2px 0; }
+  .files-legend span { display: block; margin-top: 4px; }
   .files-legend svg { vertical-align: middle; margin-right: 6px; }
   .files-legend b { color: var(--text); font-weight: 600; }
   .files-legend .muted { font-style: italic; }
@@ -86,10 +89,12 @@
   #tree svg.arrows .tip.uses { fill: var(--uses); }
   #tree svg.arrows .tip.alt { fill: var(--alt); }
   #tree svg.arrows .station { fill: var(--accent); }
-  #tree svg.arrows .station-n { fill: var(--panel); font: 600 9px system-ui, sans-serif; text-anchor: middle; }
+  #tree svg.arrows .station { stroke: var(--panel); stroke-width: 2; }
+  #tree svg.arrows .station-n { fill: var(--panel); font: 700 10px system-ui, sans-serif; text-anchor: middle; }
   .row.on-main .name { font-weight: 600; }
   #tree.selecting svg.arrows path:not(.main) { opacity: .12; }
   #tree.selecting svg.arrows path.hot { opacity: 1; stroke-width: 2.5; }
+  #tree.by-node .chip[data-srcs]:not(.hot) { opacity: .3; }
   .row { padding-right: 10px; cursor: pointer; font-size: 13px; }
   .row .line { height: 26px; display: flex; align-items: center; gap: 6px; white-space: nowrap; min-width: 0; }
   .chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 0 6px 16px; }
@@ -140,13 +145,14 @@
 <main>
   <aside id="files" aria-label="Files in this flow">
     <div class="side-head"><strong id="files-title">Files</strong><button id="files-close" aria-label="Close file tree">✕</button></div>
-    <div class="files-legend" aria-label="Arrow legend">
+    <details class="files-legend" id="legend" open>
+      <summary>What do the arrows mean?</summary>
       <span class="lg"><svg width="26" height="14"><path d="M1 7H17" stroke="var(--accent)" stroke-width="3"/><circle cx="21" cy="7" r="5" fill="var(--accent)"/></svg><b>main path</b> — the files a request passes through to reach the handler, in order ① → ②…</span>
       <span class="lg"><svg width="22" height="8"><path d="M1 4H21" stroke="var(--accent)" stroke-width="1.3"/></svg><b>calls into</b> — the handler calls a function defined in that file</span>
       <span class="lg"><svg width="22" height="8"><path d="M1 4H21" stroke="var(--uses)" stroke-width="2.2" stroke-dasharray="6 3"/></svg><b style="color:var(--uses)">plugged in here</b> — a value defined in that file (middleware, auth, layer, config) is passed into the wiring at that station</span>
       <span class="lg"><svg width="22" height="8"><path d="M1 4H21" stroke="var(--alt)" stroke-width="2.2" stroke-dasharray="2 3" stroke-linecap="round"/></svg><b style="color:var(--alt)">also used from</b> — this code is also registered or used from another place, off the main path</span>
       <span class="lg muted">Chips under a file say what arrives there; hover for the full sentence.</span>
-    </div>
+    </details>
     <div id="tree" role="tree"></div>
   </aside>
   <section id="viewport" aria-label="Flow diagram">
@@ -309,32 +315,40 @@ function fileGraph() {
   const files = new Set([entryFile, ...main]);
   const edges = new Map();
   const chips = {};
-  const add = (from, to, kind, chip, title) => {
+  // src: the chart box the arrow comes from, so clicking a box lights only its own arrows
+  const add = (src, from, to, kind, chip, title) => {
     files.add(from);
     files.add(to);
     if (from === to) return;
     const k = `${from}>${to}>${kind}`;
-    const e = edges.get(k) ?? { from, to, kind, titles: [] };
+    const e = edges.get(k) ?? { from, to, kind, titles: [], srcs: [] };
     if (!e.titles.includes(title)) e.titles.push(title);
+    if (!e.srcs.includes(src)) e.srcs.push(src);
     edges.set(k, e);
     const list = (chips[to] ??= []);
-    if (!list.some((c) => c.kind === kind && c.text === station(from) + chip)) list.push({ kind, text: station(from) + chip, title });
+    // one chip per value: the same value plugged in at several stations lists them all (②③ X)
+    const c = list.find((c) => c.kind === kind && c.name === chip) ?? (list.push({ kind, name: chip, from: [], titles: [], srcs: [] }), list.at(-1));
+    if (!c.from.includes(from)) c.from.push(from);
+    if (!c.titles.includes(title)) c.titles.push(title);
+    if (!c.srcs.includes(src)) c.srcs.push(src);
+    c.text = c.from.map((f) => station(f).trim()).sort().join("") + (c.from.some((f) => station(f)) ? " " : "") + chip;
+    c.title = c.titles.join("\n");
   };
   for (const r of DATA.reachedFrom) {
     for (const e of r.edges) {
       const to = e.to === "c0" ? entryFile : rFile[e.to];
       if (onMain(rFile[r.id], to)) continue; // that's the main path itself
       const target = e.to === "c0" ? DATA.title.replace(/^flow of /, "") : DATA.reachedFrom.find((x) => x.id === e.to).name;
-      add(rFile[r.id], to, "alt", `${r.name}`, `${target} (here) is also used by ${r.name} in ${rFile[r.id]}, via ${e.label || "a direct reference"}`);
+      add(r.id, rFile[r.id], to, "alt", `${r.name}`, `${target} (here) is also used by ${r.name} in ${rFile[r.id]}, via ${e.label || "a direct reference"}`);
     }
     for (const v of r.args) {
-      add(rFile[r.id], v.file, "uses", v.name, `${v.name} is defined here (${v.location}); ${r.name} in ${rFile[r.id]} plugs it into ${v.in}`);
+      add(r.id, rFile[r.id], v.file, "uses", v.name, `${v.name} is defined here (${v.location}); ${r.name} in ${rFile[r.id]} plugs it into ${v.in}`);
     }
   }
   for (const n of DATA.nodes) {
     for (const c of n.callees) {
       const what = c.via ?? c.name;
-      add(fileOf(n.location), c.file, "calls", what, `${c.name}${c.via ? ` (implements ${c.via})` : ""} is defined here (${c.location}); called by: ${n.label} (${n.location})`);
+      add(n.id, fileOf(n.location), c.file, "calls", what, `${c.name}${c.via ? ` (implements ${c.via})` : ""} is defined here (${c.location}); called by: ${n.label} (${n.location})`);
     }
   }
   // boxes in the diagram per file
@@ -393,7 +407,8 @@ function drawTree() {
 
   // Main path lanes: the trunk stays in one lane while it keeps its direction; when it has to turn back it moves to
   // a new lane, starting from a copy of the turning station (same number) joined to the original.
-  const LANE = 16;
+  const LANE = 22;
+  const R = 8; // station radius
   const stations = g.main.map((f) => rowOf[f]);
   const laneOf = []; // lane of each main-path segment i → i+1
   let lane = 0, dir = 0;
@@ -405,9 +420,9 @@ function drawTree() {
     laneOf.push(lane);
   }
   const lanes = lane + 1;
-  const TRUNK = 14;
+  const TRUNK = 16;
   const xOf = (l) => TRUNK + l * LANE;
-  const gutter = 32 + lanes * LANE;
+  const gutter = 72 + (lanes - 1) * LANE; // room right of the trunk for branches to curve
 
   // rows first: chips can wrap, so arrows are placed on the measured rows afterwards
   const rowEls = rows.map((r) => {
@@ -441,6 +456,7 @@ function drawTree() {
         for (const c of list.slice(0, MAX)) {
           const chip = el("span", `chip ${c.kind}`, c.text);
           chip.title = c.title;
+          chip.dataset.srcs = c.srcs.join(" ");
           box.append(chip);
         }
         if (list.length > MAX) {
@@ -474,17 +490,18 @@ function drawTree() {
     defs.append(m);
   }
   svg.append(defs);
-  const path = (d, cls, tip, from, to) => {
+  const path = (d, cls, tip, from, to, arrow = true) => {
     const p = document.createElementNS(NS, "path");
     p.setAttribute("d", d);
     p.setAttribute("class", cls);
-    p.setAttribute("marker-end", `url(#arrow-${cls})`);
+    if (arrow) p.setAttribute("marker-end", `url(#arrow-${cls})`);
     p.dataset.from = from;
     p.dataset.to = to;
     const t = document.createElementNS(NS, "title");
     t.textContent = tip;
     p.append(t);
     svg.append(p);
+    return p;
   };
 
   // where each station is drawn: the lane(s) of the segments touching it
@@ -497,31 +514,39 @@ function drawTree() {
     if (a == null || b == null || a === b) continue;
     const d = Math.sign(b - a);
     const x = xOf(laneOf[i]);
-    path(`M${x} ${yOf(a) + d * 8} V${yOf(b) - d * 9}`, "main", `${circled(i)} → ${circled(i + 1)}  ${g.main[i]} → ${g.main[i + 1]}`, g.main[i], g.main[i + 1]);
+    const y1 = yOf(a) + d * (R + 1), y2 = yOf(b) - d * (R + 2);
+    // stations on neighbouring rows: a plain link, an arrowhead wouldn't fit between the dots
+    path(`M${x} ${y1} V${y2}`, "main", `${circled(i)} → ${circled(i + 1)}  ${g.main[i]} → ${g.main[i + 1]}`, g.main[i], g.main[i + 1], Math.abs(y2 - y1) > 14);
   }
   // a station shared by two lanes: join its copies
   stationLanes.forEach((ls, i) => {
     if (ls.length < 2 || stations[i] == null) return;
     const y = yOf(stations[i]);
     const p = document.createElementNS(NS, "path");
-    p.setAttribute("d", `M${xOf(Math.min(...ls)) + 7} ${y} H${xOf(Math.max(...ls)) - 7}`);
+    p.setAttribute("d", `M${xOf(Math.min(...ls)) + R} ${y} H${xOf(Math.max(...ls)) - R}`);
     p.setAttribute("class", "main turn");
     svg.append(p);
   });
-  // branches leave from the station's last lane, right of the trunk
-  for (const e of g.edges) {
+  // branches leave from the right of the station's last lane, fanned out a little so they don't start on one point
+  const fan = {};
+  const visible = g.edges.filter((e) => rowOf[e.from] != null && rowOf[e.to] != null && rowOf[e.from] !== rowOf[e.to]);
+  for (const e of visible) (fan[e.from] ??= []).push(e);
+  for (const list of Object.values(fan)) list.sort((x, y) => rowOf[x.to] - rowOf[y.to]);
+  for (const e of visible) {
     const a = rowOf[e.from], b = rowOf[e.to];
-    if (a == null || b == null || a === b) continue;
     const si = g.main.indexOf(e.from);
-    const x0 = si >= 0 ? xOf(Math.max(...stationLanes[si])) + 7 : xOf(lanes - 1);
-    path(`M${x0} ${yOf(a)} C${gutter - 14} ${yOf(a)} ${gutter - 22} ${yOf(b)} ${gutter - 3} ${yOf(b)}`, e.kind, e.titles.join("\n"), e.from, e.to);
+    const list = fan[e.from];
+    const off = list.length > 1 ? ((list.indexOf(e) / (list.length - 1)) - 0.5) * 2 * (R - 3) : 0;
+    const x0 = si >= 0 ? xOf(Math.max(...stationLanes[si])) + R - 1 : xOf(lanes - 1);
+    const ya = yOf(a) + off, yb = yOf(b);
+    path(`M${x0} ${ya} C${x0 + 22} ${ya} ${gutter - 26} ${yb} ${gutter - 3} ${yb}`, e.kind, e.titles.join("\n"), e.from, e.to).dataset.srcs = e.srcs.join(" ");
   }
   g.main.forEach((f, i) => {
     const r = rowOf[f];
     if (r == null) return;
     for (const l of stationLanes[i]) {
       const c = document.createElementNS(NS, "circle");
-      Object.entries({ cx: xOf(l), cy: yOf(r), r: 7, class: "station" }).forEach(([k, v]) => c.setAttribute(k, v));
+      Object.entries({ cx: xOf(l), cy: yOf(r), r: R, class: "station" }).forEach(([k, v]) => c.setAttribute(k, v));
       const n = document.createElementNS(NS, "text");
       Object.entries({ x: xOf(l), y: yOf(r) + 3, class: "station-n" }).forEach(([k, v]) => n.setAttribute(k, v));
       n.textContent = String(i + 1);
@@ -536,16 +561,21 @@ function drawTree() {
 }
 
 function highlight() {
-  const f = graph.selected;
+  const f = graph.selected, node = graph.node;
+  // a clicked box: only the arrows and chips that box produces; a clicked file: everything touching the file
+  const hot = (x) => (node ? (x.dataset.srcs ?? "").split(" ").includes(node) : x.dataset.from === f || x.dataset.to === f);
   $("#tree").classList.toggle("selecting", !!f);
-  document.querySelectorAll("#tree svg.arrows path[data-from]").forEach((p) => p.classList.toggle("hot", p.dataset.from === f || p.dataset.to === f));
+  $("#tree").classList.toggle("by-node", !!(f && node));
+  document.querySelectorAll("#tree svg.arrows path[data-from]").forEach((p) => p.classList.toggle("hot", hot(p)));
+  document.querySelectorAll("#tree .chip[data-srcs]").forEach((c) => c.classList.toggle("hot", !!node && hot(c)));
   document.querySelectorAll("#tree .row.file").forEach((r) => r.classList.toggle("selected", r.dataset.file === f));
   document.querySelectorAll("#canvas .node.infile").forEach((n) => n.classList.remove("infile"));
-  for (const id of (f && graph.data.boxes[f]) || []) nodeEl(id)?.classList.add("infile");
+  for (const id of (f && !node && graph.data.boxes[f]) || []) nodeEl(id)?.classList.add("infile");
 }
 
-function selectFile(f) {
+function selectFile(f, node = null) {
   graph.selected = f;
+  graph.node = node;
   // reveal it if it sits in a collapsed directory
   if (f) for (const k of [...graph.collapsed]) if (f.startsWith(k + "/")) graph.collapsed.delete(k);
   drawTree();
@@ -558,6 +588,11 @@ function setFiles(open) {
   store.set("flow.files", open ? "open" : "closed");
 }
 $("#files-toggle").onclick = () => setFiles($("#files").hidden);
+// the legend remembers whether it was folded
+if (store.get("flow.legend") === "closed") $("#legend").open = false;
+$("#legend").addEventListener("toggle", () => {
+  store.set("flow.legend", $("#legend").open ? "open" : "closed");
+});
 $("#files-close").onclick = () => setFiles(false);
 setFiles(store.get("flow.files") ? store.get("flow.files") === "open" : innerWidth > 800);
 
@@ -623,7 +658,7 @@ window.focusNode = (id) => {
   setSidebar(true);
   show(id);
   const loc = [...DATA.nodes, ...DATA.reachedFrom].find((n) => n.id === id)?.location;
-  if (loc) selectFile(fileOf(loc));
+  if (loc) selectFile(fileOf(loc), id);
   $("#steps").scrollTop = 0;
 };
 
