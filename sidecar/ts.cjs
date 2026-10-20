@@ -921,6 +921,7 @@ function callFlow(project, entry, a) {
     mermaid += "\n" + lines.join("\n");
   }
   const data = {
+    root, // absolute, for "Open in VS Code" links
     title: `flow of ${entry.name}`,
     entry: `${rel(entry.file)}:${at(entry.file, entry.decl.getStart()).line}`,
     code: codeOf(entry, a.maxLines ?? 60),

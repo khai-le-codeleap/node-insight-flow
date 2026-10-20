@@ -768,7 +768,7 @@ mod tests {
     #[test]
     fn web_serves_flow_page_and_rejects_foreign_host() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture").canonicalize().unwrap();
-        let port = start_web(root, Arc::new(Mutex::new(None))).unwrap();
+        let port = start_web(root.clone(), Arc::new(Mutex::new(None))).unwrap();
         let get = |path: &str, host: &str| {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
             write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").unwrap();
@@ -778,6 +778,7 @@ mod tests {
         };
         let page = get("/flow?symbol=handle&file=src/flow.ts", &format!("127.0.0.1:{port}"));
         assert!(page.starts_with("HTTP/1.1 200") && page.contains("\"name\":\"memRepo.find\""), "{}", &page[..page.len().min(400)]);
+        assert!(page.contains(&format!("\"root\":{}", json!(root.to_string_lossy()))), "page data needs the absolute root for editor links");
         // A drilled-into flow carries the API it started from; the server ignores those params.
         let sub = get("/flow?file=src/flow.ts&line=9&column=10&root=symbol%3Dhandle&rootName=handle", &format!("127.0.0.1:{port}"));
         assert!(sub.starts_with("HTTP/1.1 200") && sub.contains("flow of lookup"), "{}", &sub[..sub.len().min(300)]);

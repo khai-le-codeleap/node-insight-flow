@@ -57,6 +57,11 @@
   .card-head { padding: 8px 12px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
   .card-name { font-weight: 600; overflow-wrap: anywhere; }
   .card-head a { color: var(--accent); text-decoration: none; font-size: 12px; }
+  a.editor { font-size: 11px; color: var(--muted); text-decoration: none; border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; white-space: nowrap; }
+  a.editor:hover { color: var(--accent); border-color: var(--accent); }
+  .row .line a.editor { visibility: hidden; }
+  .row:hover .line a.editor, .row.selected .line a.editor { visibility: visible; }
+  .row .line .name { flex: 1 1 auto; min-width: 0; }
   .tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); }
   .tag.error { background: transparent; border: 1px solid var(--err); color: var(--err); }
   .loc { flex-basis: 100%; min-width: 0; overflow-wrap: anywhere; color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -101,7 +106,7 @@
   .row .count { margin-left: auto; font-size: 11px; color: var(--muted); }
   .row.entry .name { font-weight: 600; }
   #canvas .node.infile rect, #canvas .node.infile polygon, #canvas .node.infile path { stroke: var(--accent) !important; stroke-width: 2px !important; stroke-dasharray: 5 3; }
-  .error { padding: 20px; color: var(--warn); white-space: pre-wrap; font-family: ui-monospace, monospace; }
+  .render-error { padding: 20px; color: var(--warn); white-space: pre-wrap; font-family: ui-monospace, monospace; }
 
   @media (max-width: 800px) {
     #sidebar, #files { position: absolute; inset: 0; width: auto; border: 0; z-index: 2; }
@@ -180,12 +185,26 @@ $("#toggle").onclick = () => setSidebar($("#sidebar").hidden);
 $("#close").onclick = () => setSidebar(false);
 setSidebar(store.get("flow.sidebar") !== "closed");
 
+/** `vscode://file/<abs path>:<line>` for a `rel/path.ts:12` location (or a bare file). */
+function editorUrl(loc) {
+  const m = /^(.*?)(?::(\d+))?$/.exec(loc);
+  return `vscode://file${encodeURI(`${DATA.root}/${m[1]}`)}${m[2] ? `:${m[2]}` : ""}`;
+}
+function editorLink(loc, text = "Open in VS Code") {
+  const a = el("a", "editor", text);
+  a.href = editorUrl(loc);
+  a.title = `Open ${loc} in VS Code`;
+  a.onclick = (e) => e.stopPropagation();
+  return a;
+}
+
 function card(name, location, code, tags = [], link = null) {
   const c = el("article", "card");
   const head = el("div", "card-head");
   head.append(el("span", "card-name", name));
   for (const [t, cls] of tags) head.append(el("span", `tag ${cls ?? ""}`, t));
   if (link) head.append(link);
+  if (/:\d+$/.test(location)) head.append(editorLink(location));
   head.append(el("span", "loc", location));
   c.append(head, el("pre", null, code));
   return c;
@@ -414,6 +433,7 @@ function drawTree() {
       line.append(el("span", "caret", ""), el("span", "name", r.name));
       const n = g.boxes[r.key]?.length;
       if (n) line.append(el("span", "count", String(n)));
+      line.append(editorLink(r.key, "VS Code"));
       const list = g.chips[r.key] ?? [];
       if (list.length) {
         const box = el("div", "chips");
@@ -629,7 +649,7 @@ async function render() {
   drawTree();
 }
 
-render().catch((e) => $("#canvas").replaceChildren(el("div", "error", String(e?.message ?? e))));
+render().catch((e) => $("#canvas").replaceChildren(el("div", "render-error", String(e?.message ?? e))));
 </script>
 </body>
 </html>
