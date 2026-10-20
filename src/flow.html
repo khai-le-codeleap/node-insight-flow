@@ -247,6 +247,17 @@ function show(id) {
   const n = DATA.nodes.find((x) => x.id === id);
   if (!n || n.kind === "start" || n.kind === "end") {
     $("#side-title").textContent = DATA.title.replace(/^flow of /, "");
+    // who uses the entry: the innermost reached-from boxes, i.e. those pointing at the start box
+    const callers = DATA.reachedFrom.filter((x) => x.edges.some((e) => e.to === "c0"));
+    steps.append(el("div", "section", callers.length ? "Called by" : "Called by: nothing outside tests"));
+    for (const c of callers) {
+      const go = el("a", null, "Show →");
+      go.href = "#";
+      go.onclick = (e) => { e.preventDefault(); focusNode(c.id); };
+      const via = c.edges.find((e) => e.to === "c0").label;
+      steps.append(card(c.name, c.location, c.code, via ? [[`via ${via}`]] : [], go));
+    }
+    steps.append(el("div", "section", "Code"));
     steps.append(card(DATA.title.replace(/^flow of /, ""), DATA.entry, DATA.code));
     if (DATA.unresolved.length) {
       steps.append(el("div", "section", "Unresolved calls (no declaration known to the checker)"));
