@@ -460,6 +460,26 @@ mod tests {
         assert!(p.contains("packages/core/tsconfig.json  1 files") && p.contains("tsconfig.json  no files"), "{p}");
     }
 
+    #[test]
+    fn ts_installing_a_package_clears_stale_resolution() {
+        let root = std::env::temp_dir().join(format!("project-mcp-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture"), &root);
+        std::fs::write(root.join("src/pkg.ts"), "import { x } from \"fake-pkg\";\nexport const y: number = x;\n").unwrap();
+        let root = root.canonicalize().unwrap();
+        let mut ts = None;
+        let diag = |ts: &mut Option<Sidecar>| semantic(&root, ts, "diagnostics", &json!({"path": "src/pkg.ts"})).unwrap();
+
+        assert!(diag(&mut ts).contains("TS2307"));
+        let pkg = root.join("node_modules/fake-pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("package.json"), r#"{"name": "fake-pkg", "types": "index.d.ts"}"#).unwrap();
+        std::fs::write(pkg.join("index.d.ts"), "export declare const x: number;\n").unwrap();
+        let after = diag(&mut ts);
+        assert!(after.starts_with("no errors"), "{after}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     fn copy_dir(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
         for e in std::fs::read_dir(from).unwrap().map(Result::unwrap) {

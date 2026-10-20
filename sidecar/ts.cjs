@@ -13,6 +13,7 @@ const RESCAN_MS = 5000;
 const IDLE_MS = 10 * 60 * 1000;
 const MAX_LINE_CHARS = 200;
 const SKIP_DIRS = ["**/node_modules", "**/.git", "**/dist", "**/build", "**/out", "**/coverage"];
+const ENV_FILES = ["node_modules", "package.json", "bun.lock", "bun.lockb", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"];
 
 // Prefer the project's own TypeScript so results match VSCode. TS >= 7 (native) has no JS
 // LanguageService, so fall back to the bundled 6.x.
@@ -59,11 +60,35 @@ class Project {
     }
     this.fileSet = new Set(this.fileNames);
     this.scanned = Date.now();
+    this.stamp = this.envStamp();
   }
 
-  /** Re-read the file list when stale (new/deleted files). */
+  /**
+   * mtimes of what module resolution depends on besides sources: the tsconfig, and node_modules,
+   * package.json and lockfiles from the project dir up to root.
+   * shortcut: `extends` targets aren't tracked, add them if edits to a shared base config go unseen.
+   */
+  envStamp() {
+    const files = this.config ? [this.config] : [];
+    for (let d = this.config ? path.dirname(this.config) : root; ; d = path.dirname(d)) {
+      for (const f of ENV_FILES) files.push(path.join(d, f));
+      if (d === root || !d.startsWith(root + path.sep)) break;
+    }
+    return files.map((f) => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } }).join(",");
+  }
+
+  /**
+   * Rebuild from scratch when deps or config changed (TS keeps failed module resolutions of unchanged
+   * files forever), else re-read the file list when stale (new/deleted files).
+   */
   fresh() {
-    if (Date.now() - this.scanned > RESCAN_MS) this.refresh();
+    if (this.envStamp() !== this.stamp) {
+      this.ls?.dispose();
+      this.ls = null;
+      this.refresh();
+    } else if (Date.now() - this.scanned > RESCAN_MS) {
+      this.refresh();
+    }
     return this;
   }
 
