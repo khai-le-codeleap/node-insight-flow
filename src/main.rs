@@ -14,7 +14,7 @@ type R = Result<String, String>;
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_LINE_CHARS: usize = 200;
 const SIDECAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/sidecar/ts.cjs");
-const SEMANTIC: &[&str] = &["go_to_definition", "find_references", "incoming_calls", "type_info", "rename_preview", "diagnostics", "ts_projects"];
+const SEMANTIC: &[&str] = &["go_to_definition", "find_references", "incoming_calls", "type_info", "rename_preview", "diagnostics", "ts_projects", "ts_reload", "call_flow"];
 
 fn main() {
     let root = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap());
@@ -37,11 +37,18 @@ fn main() {
         // Notifications (no id) need no reply.
         let Some(id) = msg.get("id").cloned() else { continue };
         let result = match msg["method"].as_str().unwrap_or("") {
-            "initialize" => json!({
+            "initialize" => {
+                // Start the sidecar now so it builds the TS programs while the client gets going.
+                // shortcut: only when the root looks like a JS/TS project; other roots start it on first use.
+                if ts.is_none() && ["tsconfig.json", "jsconfig.json", "package.json"].iter().any(|f| root.join(f).exists()) {
+                    ts = Sidecar::spawn(&root).ok();
+                }
+                json!({
                 "protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "project-mcp", "version": env!("CARGO_PKG_VERSION")},
-            }),
+                })
+            }
             "ping" => json!({}),
             "tools/list" => json!({"tools": tools()}),
             "tools/call" => call(&root, &mut ts, &msg["params"]),
@@ -94,7 +101,18 @@ fn tools() -> Value {
             target(json!({"newName": {"type": "string"}})), &["newName"]),
         tool("diagnostics", "TypeScript errors (syntactic + semantic) for a file or directory, with code and line.",
             json!({"path": path, "maxResults": max(50)}), &[]),
+        tool("call_flow", &format!("Flow of a function or API handler as a Mermaid diagram plus the code of every step. \
+Built only from the type checker: each call is resolved to its declaration, calls through interfaces/injected services \
+go to their implementations, conditional calls are dashed. Library calls are listed per step, unresolvable ones listed separately. \
+Entry: the handler's `symbol`, or `file` + `line` anywhere inside an inline handler.{TS}"),
+            target(json!({
+                "depth": {"type": "integer", "description": "Call levels to follow, 1-8 (default 4)"},
+                "maxNodes": {"type": "integer", "description": "Default 30"},
+                "maxLines": {"type": "integer", "description": "Code lines shown per step (default 60)"},
+                "includeTests": {"type": "boolean", "description": "Follow into test/mock files (default false)"},
+            })), &[]),
         tool("ts_projects", "List the tsconfig projects found (monorepo packages), their file counts and the TypeScript version in use.", json!({}), &[]),
+        tool("ts_reload", "Rebuild all TypeScript projects from scratch. Only needed if results look stale after changing packages in a way that touched no lockfile, package.json or node_modules entry.", json!({}), &[]),
     ])
 }
 
@@ -478,6 +496,41 @@ mod tests {
         let after = diag(&mut ts);
         assert!(after.starts_with("no errors"), "{after}");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ts_extends_base_config_change_is_seen() {
+        let root = std::env::temp_dir().join(format!("project-mcp-extends-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture"), &root);
+        std::fs::write(root.join("tsconfig.base.json"), r#"{"compilerOptions": {"noImplicitAny": false}}"#).unwrap();
+        std::fs::write(root.join("tsconfig.json"), r#"{"extends": "./tsconfig.base.json", "compilerOptions": {"strict": true, "noEmit": true}, "include": ["src"]}"#).unwrap();
+        std::fs::write(root.join("src/imp.ts"), "export function f(x) { return x; }\n").unwrap();
+        let root = root.canonicalize().unwrap();
+        let mut ts = None;
+        let diag = |ts: &mut Option<Sidecar>| semantic(&root, ts, "diagnostics", &json!({"path": "src/imp.ts"})).unwrap();
+
+        assert!(diag(&mut ts).starts_with("no errors"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(root.join("tsconfig.base.json"), "{}").unwrap();
+        let after = diag(&mut ts);
+        assert!(after.contains("TS7006"), "{after}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ts_call_flow_follows_checker_and_implementations() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture").canonicalize().unwrap();
+        let mut ts = None;
+        let f = semantic(&root, &mut ts, "call_flow", &json!({"symbol": "handle", "file": "src/flow.ts"})).unwrap();
+        // handle → Repo.find (interface) → memRepo.find (implementation) → lookup (conditional)
+        for want in ["([\"handle", "{{\"Repo.find", "memRepo.find", "lookup", "audit", "format", "-.->|\"2 conditional\"|"] {
+            assert!(f.contains(want), "missing {want}:\n{f}");
+        }
+        assert!(f.contains("library calls: logger.log") && !f.contains("[\"logger"), "{f}");
+        // Entry by line inside the function also works.
+        let by_line = semantic(&root, &mut ts, "call_flow", &json!({"file": "src/flow.ts", "line": 21})).unwrap();
+        assert!(by_line.contains("([\"handle"), "{by_line}");
     }
 
     fn copy_dir(from: &Path, to: &Path) {

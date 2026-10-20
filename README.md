@@ -34,18 +34,20 @@ The binary loads `sidecar/ts.cjs` from this repo, so keep the repo where it was 
 | `type_info` | Hover: inferred type + JSDoc |
 | `rename_preview` | Every `-old/+new` line a rename would produce; writes nothing |
 | `diagnostics` | Type errors for a file or directory (`maxResults`) |
+| `call_flow` | Flow of a function / API handler: Mermaid diagram + the code of every step. Built only from the type checker: calls resolved with `getResolvedSignature`, interface/service members followed to implementations, conditional calls dashed, library calls listed per step, unresolvable calls listed separately. Entry is the handler (`symbol`, or `file` + `line` inside an inline handler) |
 | `ts_projects` | tsconfig projects found, file counts, TS version |
+| `ts_reload` | Rebuild all TS projects from scratch |
 
 Semantic tools take `symbol`, plus `file` (and `line`) when the name is ambiguous, or `file` + `line` + `column`.
 An ambiguous name returns the list of candidates instead of guessing.
 
 ## How the semantic tools work
 
-- On the first semantic call the server starts `bun sidecar/ts.cjs <root>`, which builds a TypeScript `LanguageService` from the project's `tsconfig.json` (`include`/`exclude`, `paths`, `extends`). It stays in memory for the session: first call takes a moment, later ones are near-instant.
+- On `initialize` (when the root has a `tsconfig.json`, `jsconfig.json` or `package.json`; otherwise on the first semantic call) the server starts `bun sidecar/ts.cjs <root>`, which builds TypeScript `LanguageService`s from the `tsconfig.json` files (`include`/`exclude`, `paths`, `extends`) in the background. It stays in memory for the session, so even the first call is usually fast.
 - File versions are their mtime, so edits on disk are picked up on the next call without a restart; the file list is rescanned every 5 s or when an unknown file is requested.
-- A project's LanguageService is rebuilt when its `tsconfig.json`, or any `node_modules`, `package.json` or lockfile between its directory and the root, changes (e.g. after `bun install`). Otherwise TypeScript would keep reporting "Cannot find module" for packages installed after it started. Changes to an `extends` base config are not tracked yet.
+- When a project's `tsconfig.json` or its `extends` chain, or any `node_modules` (or `node_modules/@scope`), `package.json` or lockfile between its directory and the root changes (e.g. after `bun install` / `bun link`), its config is re-read and module resolution is redone, keeping already-parsed files. Otherwise TypeScript would keep reporting "Cannot find module" for packages installed after it started. For changes that touch none of those, `ts_reload` rebuilds everything.
 - The project's own `typescript` is used when it has the JS LanguageService (TS < 7). TypeScript 7 (native) has no such API, so those projects use the bundled TypeScript 6.0.3.
-- Monorepos: every `tsconfig.json` under the root (skipping `node_modules`, `dist`, `build`…) plus their `references` becomes its own project with its own LanguageService, built on first use and freed after 10 min idle. A file belongs to the deepest tsconfig that includes it. `find_references`, `rename_preview` and `incoming_calls` run in every project that sees the file and merge results, so usages in other packages are found (sources of referenced projects are used, like tsserver). Solution-style configs (`"files": []`) are skipped. `ts_projects` shows what was found.
+- Monorepos: every `tsconfig.json` under the root (skipping `node_modules`, `dist`, `build`…) plus their `references` becomes its own project with its own LanguageService, built at startup (or on first use after being freed) and freed after 10 min idle. A file belongs to the deepest tsconfig that includes it. `find_references`, `rename_preview` and `incoming_calls` run in every project that sees the file and merge results, so usages in other packages are found (sources of referenced projects are used, like tsserver). Solution-style configs (`"files": []`) are skipped. `ts_projects` shows what was found.
 - It runs alongside VSCode's tsserver, not shared with it.
 
 ## Test

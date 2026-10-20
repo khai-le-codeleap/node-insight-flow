@@ -35,6 +35,7 @@ class Project {
     this.config = config;
     this.ls = null;
     this.lastUsed = 0;
+    this.invalidated = false;
     this.refresh();
   }
 
@@ -42,15 +43,17 @@ class Project {
     this.options = {};
     this.fileNames = [];
     this.references = [];
+    this.extended = [];
     this.error = null;
     try {
       if (this.config) {
-        const { config, error } = ts.readConfigFile(this.config, ts.sys.readFile);
-        if (error) throw new Error(flat(error.messageText));
-        const parsed = ts.parseJsonConfigFileContent(config, ts.sys, path.dirname(this.config), undefined, this.config);
+        const json = ts.readJsonConfigFile(this.config, ts.sys.readFile);
+        if (json.parseDiagnostics?.length) throw new Error(flat(json.parseDiagnostics[0].messageText));
+        const parsed = ts.parseJsonSourceFileConfigFileContent(json, ts.sys, path.dirname(this.config), undefined, this.config);
         this.options = parsed.options;
         this.fileNames = parsed.fileNames;
         this.references = parsed.projectReferences ?? [];
+        this.extended = json.extendedSourceFiles ?? []; // the `extends` chain
       } else {
         this.options = { allowJs: true, noEmit: true };
         this.fileNames = ts.sys.readDirectory(root, [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"], SKIP_DIRS);
@@ -64,28 +67,32 @@ class Project {
   }
 
   /**
-   * mtimes of what module resolution depends on besides sources: the tsconfig, and node_modules,
-   * package.json and lockfiles from the project dir up to root.
-   * shortcut: `extends` targets aren't tracked, add them if edits to a shared base config go unseen.
+   * mtimes of what config and module resolution depend on besides sources: the tsconfig and its
+   * `extends` chain, and node_modules (+ its @scope dirs, for `bun link`), package.json and lockfiles
+   * from the project dir up to root.
    */
   envStamp() {
-    const files = this.config ? [this.config] : [];
+    const files = this.config ? [this.config, ...this.extended] : [];
     for (let d = this.config ? path.dirname(this.config) : root; ; d = path.dirname(d)) {
       for (const f of ENV_FILES) files.push(path.join(d, f));
+      const nm = path.join(d, "node_modules");
+      try {
+        for (const e of fs.readdirSync(nm)) if (e.startsWith("@")) files.push(path.join(nm, e));
+      } catch {}
       if (d === root || !d.startsWith(root + path.sep)) break;
     }
     return files.map((f) => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } }).join(",");
   }
 
   /**
-   * Rebuild from scratch when deps or config changed (TS keeps failed module resolutions of unchanged
-   * files forever), else re-read the file list when stale (new/deleted files).
+   * When deps or config changed, re-read the config and have TS redo module resolution (it otherwise
+   * keeps failed resolutions of unchanged files forever); parsed files are kept. Else re-read the
+   * file list when stale (new/deleted files).
    */
   fresh() {
     if (this.envStamp() !== this.stamp) {
-      this.ls?.dispose();
-      this.ls = null;
       this.refresh();
+      this.invalidated = !!this.ls;
     } else if (Date.now() - this.scanned > RESCAN_MS) {
       this.refresh();
     }
@@ -94,6 +101,10 @@ class Project {
 
   get service() {
     this.lastUsed = Date.now();
+    if (this.ls && this.invalidated) {
+      this.ls.getProgram(); // the sync that re-resolves; later syncs reuse resolutions again
+      this.invalidated = false;
+    }
     if (!this.ls) {
       const self = this;
       this.ls = ts.createLanguageService(
@@ -109,6 +120,7 @@ class Project {
           getProjectReferences: () => self.references,
           // Like tsserver: use referenced projects' sources, not their built .d.ts.
           useSourceOfProjectReferenceRedirect: () => true,
+          hasInvalidatedResolutions: () => self.invalidated,
           getDefaultLibFileName: (o) => ts.getDefaultLibFilePath(o),
           fileExists: ts.sys.fileExists,
           readFile: ts.sys.readFile,
@@ -271,7 +283,12 @@ function locate(a) {
     const sf = ps[0].program.getSourceFile(file);
     return { file, project: ps[0], pos: sf.getPositionOfLineAndCharacter(a.line - 1, a.column - 1) };
   }
-  if (!a.symbol) throw new Error("pass `symbol`, or `file` + `line` + `column`");
+  if (file && a.line && !a.symbol) {
+    const sf = ps[0].program.getSourceFile(file);
+    const indent = lineText(sf, a.line - 1).search(/\S/);
+    return { file, project: ps[0], pos: sf.getLineStarts()[a.line - 1] + Math.max(indent, 0) };
+  }
+  if (!a.symbol) throw new Error("pass `symbol`, or `file` + `line` (+ `column`)");
 
   // Search every candidate project; a file shared by several projects is listed once.
   const found = new Map();
@@ -304,6 +321,250 @@ function ambiguous(name, items) {
     return { ...h, text: `[${i.kind}${i.containerName ? ` in ${i.containerName}` : ""}]  ${h.text}` };
   });
   return `"${name}" matches ${items.length} declarations; call again with \`file\` (and \`line\`):\n${fmt(uniq(hits))}`;
+}
+
+// ---------- call flow ----------
+// Everything here comes from the type checker and the AST: calls resolve via getResolvedSignature, interface
+// members via getImplementationAtPosition, conditions from the syntax tree. Nothing is matched by text.
+
+const isFn = (n) =>
+  ts.isFunctionDeclaration(n) || ts.isMethodDeclaration(n) || ts.isArrowFunction(n) || ts.isFunctionExpression(n) ||
+  ts.isConstructorDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n);
+const isHolder = (n) => ts.isVariableDeclaration(n) || ts.isPropertyAssignment(n) || ts.isPropertyDeclaration(n);
+const isMember = (n) => ts.isMethodSignature(n) || ts.isPropertySignature(n);
+const TEST_FILE = /(\.|\/)(test|spec)\.[cm]?[jt]sx?$|\/(__tests__|__mocks__)\//;
+const inProject = (f) => !f.includes(`${path.sep}node_modules${path.sep}`) && !/\.d\.[cm]?ts$/.test(f);
+
+/** Deepest node containing pos. */
+function nodeAt(sf, pos) {
+  let found = sf;
+  const visit = (n) => {
+    if (pos >= n.getStart(sf) && pos < n.getEnd()) {
+      found = n;
+      ts.forEachChild(n, visit);
+    }
+  };
+  ts.forEachChild(sf, visit);
+  return found;
+}
+
+/** Name of the nearest named declaration around `n` (class, interface, type, variable, function). */
+function ownerName(n) {
+  for (let p = n.parent; p && !ts.isSourceFile(p); p = p.parent) {
+    if ((ts.isClassLike(p) || ts.isInterfaceDeclaration(p) || ts.isTypeAliasDeclaration(p) || ts.isVariableDeclaration(p) ||
+      ts.isFunctionDeclaration(p) || ts.isMethodDeclaration(p)) && p.name) return p.name.getText();
+  }
+}
+
+function unitName(decl) {
+  if (ts.isConstructorDeclaration(decl)) return `new ${decl.parent.name?.getText() ?? "(class)"}`;
+  if (decl.name) {
+    const owner = ownerName(decl);
+    return owner ? `${owner}.${decl.name.getText()}` : decl.name.getText();
+  }
+  // Anonymous callback: named by the call it's passed to, e.g. handlers.handle("getKpi")
+  const call = decl.parent;
+  if (call && ts.isCallExpression(call)) {
+    const lit = call.arguments.find(ts.isStringLiteralLike);
+    const callee = call.expression.getText().replace(/\s+/g, "");
+    return `${callee.length > 40 ? "…" + callee.slice(-40) : callee}(${lit ? JSON.stringify(lit.text) : "…"}) callback`;
+  }
+  return "(anonymous)";
+}
+
+/** A step of the flow: `body` is walked for calls; abstract units (interface members) dispatch to implementations. */
+function unit(decl, body, abstract = false) {
+  const sf = decl.getSourceFile();
+  return { key: `${sf.fileName}:${decl.getStart(sf)}`, file: sf.fileName, decl, body, abstract, name: unitName(decl) };
+}
+
+/** `x` without parentheses / `as` / `satisfies` / `!` around it. */
+function bare(e) {
+  while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isSatisfiesExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
+  return e;
+}
+
+/** Declaration from the checker -> unit, or null when it isn't code of ours that runs. */
+function unitFromDecl(d) {
+  if (!d) return null;
+  if (isHolder(d)) {
+    if (!d.initializer) return unit(d, null, true); // declared, e.g. class field `run: () => void`
+    // `const f = () => …` or a built function `const f = Effect.fn(…)` / `SqlSchema.findOne({…})`; anything else
+    // (`const sql = yield* SqlClient`, `const x = other`) is a value from elsewhere, not a step.
+    const init = bare(d.initializer);
+    return isFn(init) || ts.isCallExpression(init) || ts.isNewExpression(init) || ts.isTaggedTemplateExpression(init)
+      ? unit(d, d.initializer)
+      : null;
+  }
+  if (isFn(d)) {
+    const holder = isHolder(d.parent) && d.parent.initializer === d ? d.parent : d;
+    return unit(holder, d.body ?? null, !d.body);
+  }
+  if (ts.isClassDeclaration(d)) {
+    const ctor = d.members.find(ts.isConstructorDeclaration);
+    return ctor ? unit(ctor, ctor.body ?? null) : unit(d, null);
+  }
+  for (let m = d; m && !ts.isSourceFile(m); m = m.parent) if (isMember(m)) return unit(m, null, true); // function-typed member
+  return null;
+}
+
+/** What a call expression runs: {unit} | {external} | {unresolved}. */
+function resolveCall(checker, call) {
+  let d;
+  try { d = checker.getResolvedSignature(call)?.declaration; } catch {}
+  const found = (decl) => {
+    const u = unitFromDecl(decl);
+    return u ? { unit: u } : { external: true };
+  };
+  if (d && !ts.isJSDocSignature?.(d) && inProject(d.getSourceFile().fileName)) return found(d);
+  // Wrapped functions (`const f = Effect.fn(…)`, `memoize(g)`): signature from a library, but the callee is ours.
+  const expr = ts.isTaggedTemplateExpression(call) ? call.tag : call.expression;
+  let sym = checker.getSymbolAtLocation(ts.isPropertyAccessExpression(expr) ? expr.name : expr);
+  if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
+  const vd = sym?.valueDeclaration ?? sym?.declarations?.[0];
+  if (vd && inProject(vd.getSourceFile().fileName)) return found(vd);
+  return d || vd ? { external: true } : { unresolved: true };
+}
+
+function calleeText(call) {
+  const e = ts.isTaggedTemplateExpression(call) ? call.tag : call.expression;
+  const t = ts.isPropertyAccessExpression(e) && e.getText().length > 40 ? `….${e.name.getText()}` : e.getText();
+  return (ts.isNewExpression(call) ? "new " : "") + t.replace(/\s+/g, "");
+}
+
+/** Calls in `body`, in evaluation order (arguments before the call), with whether each is conditional. */
+function walkCalls(body, fn) {
+  const LOGICAL = [ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken];
+  const visit = (n, cond) => {
+    if (ts.isIfStatement(n)) {
+      visit(n.expression, cond);
+      visit(n.thenStatement, true);
+      if (n.elseStatement) visit(n.elseStatement, true);
+      return;
+    }
+    if (ts.isConditionalExpression(n)) {
+      visit(n.condition, cond);
+      visit(n.whenTrue, true);
+      visit(n.whenFalse, true);
+      return;
+    }
+    if (ts.isBinaryExpression(n) && LOGICAL.includes(n.operatorToken.kind)) {
+      visit(n.left, cond);
+      visit(n.right, true);
+      return;
+    }
+    const inner = cond || ts.isCaseClause(n) || ts.isDefaultClause(n) || ts.isCatchClause(n);
+    ts.forEachChild(n, (c) => visit(c, inner));
+    if (ts.isCallExpression(n) || ts.isNewExpression(n) || ts.isTaggedTemplateExpression(n)) {
+      fn(n, cond || !!n.questionDotToken);
+    }
+  };
+  visit(body, false);
+}
+
+function implementations(project, u, keep) {
+  const sf = u.decl.getSourceFile();
+  const name = u.decl.name ?? u.decl;
+  const out = [];
+  for (const l of project.service.getImplementationAtPosition(sf.fileName, name.getStart(sf)) ?? []) {
+    if (!inProject(l.fileName) || !keep(l.fileName)) continue;
+    let n = nodeAt(project.program.getSourceFile(l.fileName), l.textSpan.start);
+    while (n && !ts.isSourceFile(n) && !isFn(n) && !isHolder(n)) n = n.parent;
+    const impl = n && !ts.isSourceFile(n) ? unitFromDecl(n) : null;
+    if (impl && !impl.abstract && impl.key !== u.key) out.push(impl);
+  }
+  return out;
+}
+
+/** Code of a unit with line numbers, at most maxLines. */
+function codeOf(u, maxLines) {
+  const sf = u.decl.getSourceFile();
+  let n = u.decl;
+  if (ts.isVariableDeclaration(n) && ts.isVariableStatement(n.parent.parent) && n.parent.declarations.length === 1) n = n.parent.parent;
+  const first = sf.getLineAndCharacterOfPosition(n.getStart(sf)).line;
+  const last = sf.getLineAndCharacterOfPosition(n.getEnd()).line;
+  const w = String(last + 1).length;
+  const lines = [];
+  for (let i = first; i <= Math.min(last, first + maxLines - 1); i++) lines.push(`${String(i + 1).padStart(w)} │ ${lineText(sf, i)}`);
+  if (last - first + 1 > maxLines) lines.push(`${" ".repeat(w)} │ … ${last - first + 1 - maxLines} more lines`);
+  return lines.join("\n");
+}
+
+function callFlow(project, entry, a) {
+  const depth = Math.min(Math.max(a.depth ?? 4, 1), 8);
+  const maxNodes = a.maxNodes ?? 30;
+  const maxLines = a.maxLines ?? 60;
+  const keep = (f) => a.includeTests || !TEST_FILE.test(f);
+  const checker = project.program.getTypeChecker();
+  const nodes = new Map();
+  const edges = [];
+  const unresolved = [];
+  let truncated = false;
+  const add = (u) => {
+    if (!nodes.has(u.key)) nodes.set(u.key, { ...u, id: `n${nodes.size}`, externals: new Set(), unexpanded: false });
+    return nodes.get(u.key);
+  };
+  const room = (u) => nodes.has(u.key) || nodes.size < maxNodes || ((truncated = true), false);
+
+  const queue = [[add(entry), 0]];
+  const done = new Set();
+  while (queue.length) {
+    const [n, d] = queue.shift();
+    if (done.has(n.key)) continue;
+    done.add(n.key);
+    if (n.abstract) {
+      for (const impl of implementations(project, n, keep)) {
+        if (!room(impl)) break;
+        const m = add(impl);
+        edges.push({ from: n, to: m, kind: "impl" });
+        queue.push([m, d]); // dispatch, not a call level
+      }
+      continue;
+    }
+    if (!n.body) continue;
+    if (d >= depth) {
+      n.unexpanded = true;
+      continue;
+    }
+    let order = 0;
+    const linked = new Set();
+    walkCalls(n.body, (call, cond) => {
+      const r = resolveCall(checker, call);
+      if (r.external) return n.externals.add(calleeText(call));
+      if (r.unresolved) return unresolved.push({ ...at(n.file, call.getStart()), text: calleeText(call) });
+      if (!keep(r.unit.file) || !room(r.unit)) return;
+      const m = add(r.unit);
+      if (linked.has(m.key)) return;
+      linked.add(m.key);
+      edges.push({ from: n, to: m, kind: "call", order: ++order, cond });
+      queue.push([m, d + 1]);
+    });
+  }
+
+  const esc = (t) => t.replace(/"/g, "#quot;");
+  const label = (n) => esc(`${n.name}<br/>${rel(n.file)}:${at(n.file, n.decl.getStart()).line}${n.unexpanded ? "<br/>(not expanded)" : ""}`);
+  const all = [...nodes.values()];
+  const mermaid = ["flowchart TD"];
+  for (const n of all) {
+    const l = label(n);
+    mermaid.push(n.id === "n0" ? `  ${n.id}(["${l}"])` : n.abstract ? `  ${n.id}{{"${l}"}}` : `  ${n.id}["${l}"]`);
+  }
+  for (const e of edges) {
+    if (e.kind === "impl") mermaid.push(`  ${e.from.id} -.->|"implemented by"| ${e.to.id}`);
+    else if (e.cond) mermaid.push(`  ${e.from.id} -.->|"${e.order} conditional"| ${e.to.id}`);
+    else mermaid.push(`  ${e.from.id} -->|"${e.order}"| ${e.to.id}`);
+  }
+
+  let out = `flow of ${entry.name} (${rel(entry.file)}:${at(entry.file, entry.decl.getStart()).line}): ${all.length} steps, depth ${depth}`;
+  if (truncated) out += `, stopped at maxNodes=${maxNodes}`;
+  out += "\n\n```mermaid\n" + mermaid.join("\n") + "\n```\n";
+  for (const n of all) {
+    out += `\n### ${n.id} ${n.name}${n.abstract ? " (interface)" : ""} — ${rel(n.file)}:${at(n.file, n.decl.getStart()).line}\n`;
+    if (n.externals.size) out += `library calls: ${[...n.externals].join(", ")}\n`;
+    out += "```ts\n" + codeOf(n, maxLines) + "\n```\n";
+  }
+  if (unresolved.length) out += `\nunresolved calls (no declaration known to the checker, e.g. \`any\`):\n${fmt(uniq(unresolved))}\n`;
+  return out.trimEnd();
 }
 
 // ---------- tools ----------
@@ -452,6 +713,25 @@ const tools = {
     return out.length ? out.join("\n") : `no errors in ${files.size} files`;
   },
 
+  call_flow: positional(({ file, pos, project }, a) => {
+    // Entry: the function-like (or `const f = …`) enclosing the position.
+    let n = nodeAt(project.program.getSourceFile(file), pos);
+    let entry = null;
+    for (; n && !ts.isSourceFile(n) && !entry; n = n.parent) if (isFn(n) || isHolder(n)) entry = unitFromDecl(n);
+    if (!entry || !entry.body) throw new Error("no function at that position; point at a function, method or inline handler");
+    return callFlow(project, entry, a);
+  }),
+
+  ts_reload() {
+    for (const p of projects.values()) {
+      p.ls?.dispose();
+      p.ls = null;
+      p.refresh();
+    }
+    discover();
+    return tools.ts_projects();
+  },
+
   ts_projects() {
     const list = [...projects.values()].sort((a, b) => (a.config ?? "").localeCompare(b.config ?? ""));
     return list
@@ -468,6 +748,13 @@ const tools = {
 
 const reply = (m) => process.stdout.write(JSON.stringify(m) + "\n");
 discover();
+// Warm up: build every program now so the first tool call doesn't pay for it. Requests arriving
+// meanwhile are queued, not lost.
+setImmediate(() => {
+  for (const p of active()) {
+    try { p.service.getProgram().getTypeChecker(); } catch {}
+  }
+});
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   let id = null;
   req = { programs: new Map(), files: new Map() };
