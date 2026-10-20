@@ -426,40 +426,27 @@ function resolveCall(checker, call) {
   return d || vd ? { external: true } : { unresolved: true };
 }
 
+/** Whether `t` is a class whose inheritance chain reaches the built-in Error (checker base types, not names in our code). */
+function isErrorType(checker, t) {
+  const seen = new Set();
+  const queue = [t];
+  while (queue.length) {
+    let x = queue.pop();
+    x = x?.target ?? x; // TypeReference -> its class
+    if (!x || seen.has(x)) continue;
+    seen.add(x);
+    const decl = x.symbol?.declarations?.[0];
+    if (x.symbol?.name === "Error" && decl && !inProject(decl.getSourceFile().fileName)) return true;
+    if (x.objectFlags & ts.ObjectFlags.ClassOrInterface) queue.push(...(checker.getBaseTypes(x) ?? []));
+    if (x.flags & ts.TypeFlags.Intersection) queue.push(...x.types);
+  }
+  return false;
+}
+
 function calleeText(call) {
   const e = ts.isTaggedTemplateExpression(call) ? call.tag : call.expression;
   const t = ts.isPropertyAccessExpression(e) && e.getText().length > 40 ? `….${e.name.getText()}` : e.getText();
   return (ts.isNewExpression(call) ? "new " : "") + t.replace(/\s+/g, "");
-}
-
-/** Calls in `body`, in evaluation order (arguments before the call), with whether each is conditional. */
-function walkCalls(body, fn) {
-  const LOGICAL = [ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken];
-  const visit = (n, cond) => {
-    if (ts.isIfStatement(n)) {
-      visit(n.expression, cond);
-      visit(n.thenStatement, true);
-      if (n.elseStatement) visit(n.elseStatement, true);
-      return;
-    }
-    if (ts.isConditionalExpression(n)) {
-      visit(n.condition, cond);
-      visit(n.whenTrue, true);
-      visit(n.whenFalse, true);
-      return;
-    }
-    if (ts.isBinaryExpression(n) && LOGICAL.includes(n.operatorToken.kind)) {
-      visit(n.left, cond);
-      visit(n.right, true);
-      return;
-    }
-    const inner = cond || ts.isCaseClause(n) || ts.isDefaultClause(n) || ts.isCatchClause(n);
-    ts.forEachChild(n, (c) => visit(c, inner));
-    if (ts.isCallExpression(n) || ts.isNewExpression(n) || ts.isTaggedTemplateExpression(n)) {
-      fn(n, cond || !!n.questionDotToken);
-    }
-  };
-  visit(body, false);
 }
 
 function implementations(project, u, keep) {
@@ -490,100 +477,266 @@ function codeOf(u, maxLines) {
   return lines.join("\n");
 }
 
-function callFlow(project, entry, a) {
-  const depth = Math.min(Math.max(a.depth ?? 4, 1), 8);
-  const maxNodes = a.maxNodes ?? 30;
-  const maxLines = a.maxLines ?? 60;
-  const keep = (f) => a.includeTests || !TEST_FILE.test(f);
-  const checker = project.program.getTypeChecker();
-  const nodes = new Map();
-  const edges = [];
-  const unresolved = [];
-  let truncated = false;
-  const add = (u) => {
-    if (!nodes.has(u.key)) nodes.set(u.key, { ...u, id: `n${nodes.size}`, externals: new Set(), unexpanded: false });
-    return nodes.get(u.key);
+// ---------- control flow ----------
+// The entry function's statements as a flowchart: chained in source order, branches from if/switch/loops/try,
+// ends at return/throw. Inline callbacks (Effect.gen(function* …), withTransaction(…)) become titled groups.
+
+/** Source text on one line, clipped. */
+const snippet = (n, max = 70) => {
+  const t = n.getText().replace(/\s+/g, " ").trim();
+  return t.length > max ? t.slice(0, max - 1) + "…" : t;
+};
+
+/** A unit to show for a callee: interface members with one implementation resolve to it. */
+function concrete(project, u, keep) {
+  if (!u.abstract) return u;
+  const impls = implementations(project, u, keep);
+  return impls.length === 1 ? { ...impls[0], via: u.name } : u;
+}
+
+function calleeInfo(u, checker, call, maxLines) {
+  const sf = u.decl.getSourceFile();
+  const nameNode = u.decl.name ?? u.decl;
+  const { line, character } = sf.getLineAndCharacterOfPosition(nameNode.getStart(sf));
+  return {
+    name: u.name,
+    location: `${rel(u.file)}:${line + 1}`,
+    file: rel(u.file),
+    line: line + 1,
+    column: character + 1,
+    via: u.via ?? null,
+    abstract: u.abstract,
+    error: ts.isNewExpression(call) && isErrorType(checker, checker.getTypeAtLocation(call)),
+    code: codeOf(u, maxLines),
   };
-  const room = (u) => nodes.has(u.key) || nodes.size < maxNodes || ((truncated = true), false);
+}
 
-  const queue = [[add(entry), 0]];
-  const done = new Set();
-  while (queue.length) {
-    const [n, d] = queue.shift();
-    if (done.has(n.key)) continue;
-    done.add(n.key);
-    if (n.abstract) {
-      for (const impl of implementations(project, n, keep)) {
-        if (!room(impl)) break;
-        const m = add(impl);
-        edges.push({ from: n, to: m, kind: "impl" });
-        queue.push([m, d]); // dispatch, not a call level
+function controlFlow(project, entry, a, keep) {
+  const checker = project.program.getTypeChecker();
+  const maxLines = a.maxLines ?? 60;
+  const nodes = [];
+  const edges = [];
+  const groups = []; // {id, title, parent}
+  const stack = [];
+  // One entry per callback being built: its `return`s, which resume the outer flow after the callback.
+  const returns = [];
+  const unresolved = [];
+
+  const add = (kind, label, at_, extra = {}) => {
+    const sf = at_.getSourceFile();
+    const first = sf.getLineAndCharacterOfPosition(at_.getStart(sf)).line;
+    const last = sf.getLineAndCharacterOfPosition(at_.getEnd()).line;
+    const lines = [];
+    for (let i = first; i <= Math.min(last, first + 29); i++) lines.push(`${String(i + 1).padStart(String(last + 1).length)} │ ${lineText(sf, i)}`);
+    if (last - first > 29) lines.push(`… ${last - first - 29} more lines`);
+    const node = { id: `c${nodes.length}`, kind, label, group: stack.at(-1) ?? null, location: `${rel(sf.fileName)}:${first + 1}`, code: lines.join("\n"), callees: [], ...extra };
+    nodes.push(node);
+    return node.id;
+  };
+  const link = (exits, to) => {
+    for (const x of exits) edges.push({ from: x.id, to, label: x.label ?? null, dashed: !!x.dashed });
+  };
+
+  /** Project calls in `n` outside nested functions, and the nested functions (callbacks) themselves. */
+  function scan(n) {
+    const calls = [];
+    const callbacks = [];
+    const visit = (c) => {
+      if (isFn(c)) return void callbacks.push(c);
+      ts.forEachChild(c, visit);
+      if (ts.isCallExpression(c) || ts.isNewExpression(c) || ts.isTaggedTemplateExpression(c)) {
+        const r = resolveCall(checker, c);
+        if (r.unresolved) unresolved.push({ ...at(c.getSourceFile().fileName, c.getStart()), text: calleeText(c) });
+        if (r.unit && keep(r.unit.file)) calls.push(calleeInfo(concrete(project, r.unit, keep), checker, c, maxLines));
       }
-      continue;
-    }
-    if (!n.body) continue;
-    if (d >= depth) {
-      n.unexpanded = true;
-      continue;
-    }
-    let order = 0;
-    const linked = new Set();
-    walkCalls(n.body, (call, cond) => {
-      const r = resolveCall(checker, call);
-      if (r.external) return n.externals.add(calleeText(call));
-      if (r.unresolved) return unresolved.push({ ...at(n.file, call.getStart()), text: calleeText(call) });
-      if (!keep(r.unit.file) || !room(r.unit)) return;
-      const m = add(r.unit);
-      if (linked.has(m.key)) return;
-      linked.add(m.key);
-      edges.push({ from: n, to: m, kind: "call", order: ++order, cond });
-      queue.push([m, d + 1]);
-    });
+    };
+    if (isFn(n)) callbacks.push(n);
+    else visit(n);
+    const seen = new Set();
+    return { calls: calls.filter((c) => !seen.has(c.location) && seen.add(c.location)), callbacks };
   }
 
-  // Mermaid labels are HTML: names can carry string literals from code, so escape everything markup-ish.
-  const esc = (t) => t.replace(/&/g, "#amp;").replace(/"/g, "#quot;").replace(/</g, "#lt;").replace(/>/g, "#gt;");
-  const lineOf = (n) => at(n.file, n.decl.getStart()).line;
-  const label = (n) => [n.name, `${rel(n.file)}:${lineOf(n)}`, ...(n.unexpanded ? ["(not expanded)"] : [])].map(esc).join("<br/>");
-  const all = [...nodes.values()];
-  const mermaid = ["flowchart TD"];
-  for (const n of all) {
-    const l = label(n);
-    mermaid.push(n.id === "n0" ? `  ${n.id}(["${l}"])` : n.abstract ? `  ${n.id}{{"${l}"}}` : `  ${n.id}["${l}"]`);
+  /** Callback bodies as groups, chained after `exits`. */
+  function callbacksOf(callbacks, exits) {
+    for (const fn of callbacks) {
+      const parent = fn.parent && ts.isCallExpression(fn.parent) ? fn.parent : null;
+      const gid = `g${groups.length}`;
+      groups.push({ id: gid, title: parent ? `${calleeText(parent)}(…)` : "callback", parent: stack.at(-1) ?? null });
+      stack.push(gid);
+      returns.push([]);
+      const before = nodes.length;
+      const out = ts.isBlock(fn.body) ? seq(fn.body.statements, exits) : expr(fn.body, exits, fn.body);
+      const returned = returns.pop();
+      stack.pop();
+      if (nodes.length === before) groups.pop(); // nothing of ours inside
+      else exits = [...out, ...returned];
+    }
+    return exits;
   }
+
+  /** A plain statement/expression: one step if it calls our code, plus its callbacks. */
+  function expr(n, exits, labelNode) {
+    const { calls, callbacks } = scan(n);
+    if (calls.length) {
+      const id = add(calls.every((c) => c.error) ? "error" : "step", snippet(labelNode), labelNode, { callees: calls });
+      link(exits, id);
+      exits = [{ id }];
+    }
+    return callbacksOf(callbacks, exits);
+  }
+
+  function terminal(kind, s, exits) {
+    const { calls, callbacks } = s.expression ? scan(s.expression) : { calls: [], callbacks: [] };
+    exits = callbacksOf(callbacks, exits);
+    // `return` inside a callback ends the callback, not the function: flow goes on after it.
+    const resumes = kind === "return" && returns.length > 0;
+    // `return yield* new XError(…)` / `return Effect.fail(new XError(…))`: an error outcome, shown red like throw.
+    const failed = calls.some((c) => c.error);
+    const id = add(resumes ? "resume" : kind, snippet(s).replace(/;$/, ""), s, { callees: calls, failed });
+    link(exits, id);
+    if (resumes) returns.at(-1).push({ id });
+    return [];
+  }
+
+  function seq(stmts, exits) {
+    for (const s of stmts) {
+      if (!exits.length) break; // after return/throw: unreachable
+      exits = stmt(s, exits);
+    }
+    return exits;
+  }
+
+  function stmt(s, exits) {
+    if (ts.isBlock(s)) return seq(s.statements, exits);
+    if (ts.isIfStatement(s)) {
+      exits = expr(s.expression, exits, s.expression);
+      const d = add("decision", `if (${snippet(s.expression, 60)})`, s.expression);
+      link(exits, d);
+      const yes = stmt(s.thenStatement, [{ id: d, label: "yes" }]);
+      const no = s.elseStatement ? stmt(s.elseStatement, [{ id: d, label: "no" }]) : [{ id: d, label: "no" }];
+      return [...yes, ...no];
+    }
+    if (ts.isReturnStatement(s)) return terminal("return", s, exits);
+    if (ts.isThrowStatement(s)) return terminal("throw", s, exits);
+    if (ts.isForStatement(s) || ts.isForOfStatement(s) || ts.isForInStatement(s) || ts.isWhileStatement(s)) {
+      const head = s.getText().slice(0, s.statement.getStart() - s.getStart()).replace(/\s+/g, " ").trim();
+      const d = add("decision", head.length > 70 ? head.slice(0, 69) + "…" : head, s);
+      link(exits, d);
+      link(stmt(s.statement, [{ id: d, label: "each" }]), d);
+      return [{ id: d, label: "done" }];
+    }
+    if (ts.isDoStatement(s)) {
+      const before = nodes.length;
+      const inner = stmt(s.statement, exits);
+      const d = add("decision", `while (${snippet(s.expression, 50)})`, s.expression);
+      link(inner, d);
+      const first = nodes[before]; // first step of the body, where "again" jumps back to
+      if (first && first.id !== d) edges.push({ from: d, to: first.id, label: "again", dashed: false });
+      return [{ id: d, label: "done" }];
+    }
+    if (ts.isSwitchStatement(s)) {
+      exits = expr(s.expression, exits, s.expression);
+      const d = add("decision", `switch (${snippet(s.expression, 50)})`, s.expression);
+      link(exits, d);
+      let out = [];
+      let hasDefault = false;
+      for (const c of s.caseBlock.clauses) {
+        hasDefault ||= ts.isDefaultClause(c);
+        const label = ts.isDefaultClause(c) ? "default" : `case ${snippet(c.expression, 30)}`;
+        out.push(...seq(c.statements, [{ id: d, label }]));
+      }
+      if (!hasDefault) out.push({ id: d, label: "other" });
+      return out;
+    }
+    if (ts.isTryStatement(s)) {
+      const gid = `g${groups.length}`;
+      groups.push({ id: gid, title: "try", parent: stack.at(-1) ?? null });
+      stack.push(gid);
+      const before = nodes.length;
+      let out = seq(s.tryBlock.statements, exits);
+      stack.pop();
+      const empty = nodes.length === before;
+      if (empty) groups.pop();
+      if (s.catchClause) {
+        const c = add("catch", `catch${s.catchClause.variableDeclaration ? ` (${snippet(s.catchClause.variableDeclaration, 30)})` : ""}`, s.catchClause);
+        // Any statement in the try block may throw: the edge leaves the whole group.
+        if (empty) link(exits, c);
+        else edges.push({ from: gid, to: c, label: "on error", dashed: true });
+        out = [...out, ...seq(s.catchClause.block.statements, [{ id: c }])];
+      }
+      if (s.finallyBlock) out = seq(s.finallyBlock.statements, out);
+      return out;
+    }
+    if (ts.isLabeledStatement(s)) return stmt(s.statement, exits);
+    if (ts.isFunctionDeclaration(s) || ts.isClassDeclaration(s) || ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s)) return exits;
+    // shortcut: break/continue just end the branch's statements, they don't jump to the loop exit/head.
+    return expr(s, exits, s);
+  }
+
+  const start = add("start", entry.name, entry.decl);
+  let exits = [{ id: start }];
+  // `const f = (…) => …`: the entry's body is the arrow's body, not a callback.
+  const body = entry.body && isFn(entry.body) ? entry.body.body : entry.body;
+  exits = ts.isBlock(body) ? seq(body.statements, exits) : expr(body, exits, body);
+  if (exits.length) link(exits, add("end", "end", entry.decl));
+
+  // ---- mermaid ----
+  const esc = (t) => t.replace(/&/g, "#amp;").replace(/"/g, "#quot;").replace(/</g, "#lt;").replace(/>/g, "#gt;").replace(/`/g, "#96;");
+  const shape = (n) => {
+    const l = esc(n.label);
+    if (n.kind === "start" || n.kind === "end" || n.kind === "return" || n.kind === "throw") return `([\"${l}\"])`;
+    if (n.kind === "decision") return `{\"${l}\"}`;
+    if (n.kind === "resume") return `(\"${l}\")`;
+    if (n.kind === "catch") return `[/\"${l}\"/]`;
+    return `[\"${l}\"]`;
+  };
+  const out = ["flowchart TD", "  classDef error stroke:#d9534f,stroke-width:2px,color:#d9534f"];
+  const emit = (parent, indent) => {
+    for (const n of nodes.filter((x) => x.group === parent)) {
+      out.push(`${indent}${n.id}${shape(n)}${n.kind === "throw" || n.kind === "error" || n.failed ? ":::error" : ""}`);
+    }
+    for (const g of groups.filter((x) => x.parent === parent)) {
+      out.push(`${indent}subgraph ${g.id}[\"${esc(g.title)}\"]`, `${indent}  direction TB`);
+      emit(g.id, indent + "  ");
+      out.push(`${indent}end`, `${indent}style ${g.id} fill:none,stroke-dasharray:4 3`);
+    }
+  };
+  emit(null, "  ");
   for (const e of edges) {
-    if (e.kind === "impl") mermaid.push(`  ${e.from.id} -.->|"implemented by"| ${e.to.id}`);
-    else if (e.cond) mermaid.push(`  ${e.from.id} -.->|"${e.order} conditional"| ${e.to.id}`);
-    else mermaid.push(`  ${e.from.id} -->|"${e.order}"| ${e.to.id}`);
+    const arrow = e.dashed ? "-.->" : "-->";
+    out.push(`  ${e.from} ${arrow}${e.label ? `|\"${esc(e.label)}\"|` : ""} ${e.to}`);
   }
+  return { mermaid: out.join("\n"), nodes, groups, unresolved };
+}
 
+function callFlow(project, entry, a) {
+  const keep = (f) => a.includeTests || !TEST_FILE.test(f);
+  const cf = controlFlow(project, entry, a, keep);
   const data = {
     title: `flow of ${entry.name}`,
-    entry: `${rel(entry.file)}:${lineOf(entry)}`,
-    depth,
-    maxNodes,
-    truncated,
-    mermaid: mermaid.join("\n"),
-    steps: all.map((n) => ({
-      id: n.id,
-      name: n.name,
-      location: `${rel(n.file)}:${lineOf(n)}`,
-      abstract: n.abstract,
-      unexpanded: n.unexpanded,
-      externals: [...n.externals],
-      code: codeOf(n, maxLines),
-    })),
-    unresolved: uniq(unresolved).map((h) => ({ location: `${rel(h.file)}:${h.line}`, text: h.text })),
+    entry: `${rel(entry.file)}:${at(entry.file, entry.decl.getStart()).line}`,
+    code: codeOf(entry, a.maxLines ?? 60),
+    mermaid: cf.mermaid,
+    nodes: cf.nodes,
+    unresolved: uniq(cf.unresolved).map((h) => ({ location: `${rel(h.file)}:${h.line}`, text: h.text })),
   };
   if (a.format === "json") return JSON.stringify(data);
 
-  let out = `${data.title} (${data.entry}): ${all.length} steps, depth ${depth}`;
-  if (truncated) out += `, stopped at maxNodes=${maxNodes}`;
-  out += "\n\n```mermaid\n" + data.mermaid + "\n```\n";
-  for (const st of data.steps) {
-    out += `\n### ${st.id} ${st.name}${st.abstract ? " (interface)" : ""} — ${st.location}\n`;
-    if (st.externals.length) out += `library calls: ${st.externals.join(", ")}\n`;
-    out += "```ts\n" + st.code + "\n```\n";
+  let out = `${data.title} (${data.entry})\n`;
+  out += "(boxes = statements calling project code, in source order; diamonds = branches/loops; rounded ends = return/throw, red = error; dashed groups = inline callbacks)\n";
+  out += "\n```mermaid\n" + data.mermaid + "\n```\n";
+  const called = new Map();
+  const steps = data.nodes.filter((n) => n.callees.length);
+  if (steps.length) {
+    out += "\nsteps:\n";
+    for (const n of steps) {
+      out += `${n.id}  ${n.location}  ${n.label}\n    calls: ${n.callees.map((c) => `${c.name} (${c.location})`).join(", ")}\n`;
+      for (const c of n.callees) called.set(c.location, c);
+    }
+  }
+  for (const c of called.values()) {
+    const tags = [c.via && `implements ${c.via}`, c.abstract && "interface", c.error && "error"].filter(Boolean);
+    out += `\n### ${c.name}${tags.length ? ` (${tags.join(", ")})` : ""} — ${c.location}\n` + "```ts\n" + c.code + "\n```\n";
   }
   if (data.unresolved.length) {
     out += `\nunresolved calls (no declaration known to the checker, e.g. \`any\`):\n`;

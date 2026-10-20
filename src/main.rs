@@ -112,15 +112,14 @@ fn tools() -> Value {
             target(json!({"newName": {"type": "string"}})), &["newName"]),
         tool("diagnostics", "TypeScript errors (syntactic + semantic) for a file or directory, with code and line.",
             json!({"path": path, "maxResults": max(50)}), &[]),
-        tool("call_flow", &format!("Flow of a function or API handler as a Mermaid diagram plus the code of every step. \
-Built only from the type checker: each call is resolved to its declaration, calls through interfaces/injected services \
-go to their implementations, conditional calls are dashed. Library calls are listed per step, unresolvable ones listed separately. \
-Entry: the handler's `symbol`, or `file` + `line` anywhere inside an inline handler.{TS}"),
+        tool("call_flow", &format!("Control-flow chart (Mermaid) of a function or API handler: statements that call project code, \
+chained in source order, with if/switch/loop/try branches and return/throw ends, plus the code of every function called. \
+Built from the syntax tree and the type checker: calls resolve to their declarations, interface/injected-service calls to \
+their implementation. Unresolvable calls are listed separately. To go deeper, call it again on a called function. \
+Entry: the handler's `symbol`, or `file` + `line` anywhere inside an inline handler. The result starts with a link to an interactive page.{TS}"),
             target(json!({
-                "depth": {"type": "integer", "description": "Call levels to follow, 1-8 (default 4)"},
-                "maxNodes": {"type": "integer", "description": "Default 30"},
-                "maxLines": {"type": "integer", "description": "Code lines shown per step (default 60)"},
-                "includeTests": {"type": "boolean", "description": "Follow into test/mock files (default false)"},
+                "maxLines": {"type": "integer", "description": "Code lines shown per called function (default 60)"},
+                "includeTests": {"type": "boolean", "description": "Also show calls into test/mock files (default false)"},
             })), &[]),
         tool("ts_projects", "List the tsconfig projects found (monorepo packages), their file counts and the TypeScript version in use.", json!({}), &[]),
         tool("ts_reload", "Rebuild all TypeScript projects from scratch. Only needed if results look stale after changing packages in a way that touched no lockfile, package.json or node_modules entry.", json!({}), &[]),
@@ -217,7 +216,7 @@ fn lock(ts: &Ts) -> MutexGuard<'_, Option<Sidecar>> {
 // ---------- call_flow web page ----------
 
 /// call_flow args carried in the page URL, so each load re-runs against the current code.
-const FLOW_ARGS: &[&str] = &["symbol", "file", "line", "column", "depth", "maxNodes", "maxLines", "includeTests"];
+const FLOW_ARGS: &[&str] = &["symbol", "file", "line", "column", "maxLines", "includeTests"];
 
 fn start_web(root: PathBuf, ts: Ts) -> io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -672,11 +671,58 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture").canonicalize().unwrap();
         let mut ts = None;
         let f = semantic(&root, &mut ts, "call_flow", &json!({"symbol": "handle", "file": "src/flow.ts"})).unwrap();
-        // handle → Repo.find (interface) → memRepo.find (implementation) → lookup (conditional)
-        for want in ["([\"handle", "{{\"Repo.find", "memRepo.find", "lookup", "audit", "format", "-.->|\"2 conditional\"|"] {
+        // Statements chained in order; the interface call resolves to its only implementation.
+        for want in [
+            "flowchart TD",
+            "c0([\"handle\"])",
+            "c1[\"const v = repo.find(id);\"]",
+            "c2{\"if (!v)\"}",
+            "c2 -->|\"yes\"| c3",
+            "c2 -->|\"no\"| c4",
+            "c3 --> c4",
+            "c4([\"return format(v ?? #quot;#quot;)\"])",
+            "### memRepo.find (implements Repo.find)",
+            "### audit",
+        ] {
             assert!(f.contains(want), "missing {want}:\n{f}");
         }
-        assert!(f.contains("library calls: logger.log") && !f.contains("[\"logger"), "{f}");
+        assert!(!f.contains("### logger"), "a value from elsewhere is not a callee:\n{f}");
+        // `throw new NotFound(…)` (an Error subclass, per the checker) is a red end; its constructor's callees aren't listed.
+        let m = semantic(&root, &mut ts, "call_flow", &json!({"symbol": "must", "file": "src/flow.ts"})).unwrap();
+        assert!(m.contains("([\"throw new NotFound(id)\"]):::error") && m.contains("### new NotFound (error)") && !m.contains("### describe"), "{m}");
+        // Control flow: statements chained in order, if/loop/try as branches, returns as ends.
+        let c = semantic(&root, &mut ts, "call_flow", &json!({"symbol": "checkout", "file": "src/flow.ts", "format": "json"})).unwrap();
+        let c: Value = serde_json::from_str(&c).unwrap();
+        let cf = c["mermaid"].as_str().unwrap();
+        for want in [
+            "c1[\"const first = must(repo, ids[0]);\"]",
+            "c2{\"for (const id of ids)\"}",
+            "c1 --> c2",
+            "c2 -->|\"each\"| c3",
+            "c3 --> c2",
+            "c4{\"if (first.length #gt; 3)\"}",
+            "c2 -->|\"done\"| c4",
+            "c4 -->|\"yes\"| c5",
+            "c5([\"return format(first)\"])",
+            "c4 -->|\"no\"| ",
+            "-.->|\"on error\"|",
+            "c9([\"return first\"])",
+        ] {
+            assert!(cf.contains(want), "missing {want}:\n{cf}");
+        }
+        let step = c["nodes"].as_array().unwrap().iter().find(|n| n["id"] == "c1").unwrap();
+        assert_eq!(step["callees"][0]["name"], "must");
+        assert_eq!(step["callees"][0]["line"], 37);
+
+        // A return inside a callback resumes the outer function, it doesn't end the flow.
+        let w = semantic(&root, &mut ts, "call_flow", &json!({"symbol": "withCallback", "file": "src/flow.ts", "format": "json"})).unwrap();
+        let w: Value = serde_json::from_str(&w).unwrap();
+        let wf = w["mermaid"].as_str().unwrap();
+        let last = w["nodes"].as_array().unwrap().iter().find(|n| n["label"] == "return format(v)").unwrap()["id"].as_str().unwrap().to_string();
+        let hit = w["nodes"].as_array().unwrap().iter().find(|n| n["label"] == "return \"hit\"").unwrap()["id"].as_str().unwrap().to_string();
+        assert!(wf.contains(&format!("{hit} --> ")), "callback return must continue:\n{wf}");
+        assert!(wf.contains(&format!("--> {last}")), "{wf}");
+
         // Entry by line inside the function also works.
         let by_line = semantic(&root, &mut ts, "call_flow", &json!({"file": "src/flow.ts", "line": 21})).unwrap();
         assert!(by_line.contains("([\"handle"), "{by_line}");

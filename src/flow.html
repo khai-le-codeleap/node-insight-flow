@@ -7,43 +7,61 @@
 <style>
   :root {
     --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70; --border: #e2e2e0;
-    --accent: #2f6fde; --accent-soft: #e7effc; --code-bg: #f3f3f1; --warn: #a15c00;
+    --accent: #2f6fde; --accent-soft: #e7effc; --code-bg: #f3f3f1; --warn: #a15c00; --btn: #efefed; --err: #d9534f;
     color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #151517; --panel: #1e1e21; --text: #ececee; --muted: #9a9aa2; --border: #33333a;
-      --accent: #6f9cf0; --accent-soft: #24304a; --code-bg: #18181b; --warn: #e0a050;
+      --accent: #6f9cf0; --accent-soft: #24304a; --code-bg: #18181b; --warn: #e0a050; --btn: #2a2a2f;
       color-scheme: dark;
     }
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  header { padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--panel); display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
-  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
-  header .meta { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
-  header a { color: var(--accent); font-size: 13px; margin-left: auto; text-decoration: none; }
-  main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 46%); height: calc(100vh - 53px); }
-  #diagram { overflow: auto; padding: 20px; border-right: 1px solid var(--border); }
-  #diagram svg { max-width: none; height: auto; }
-  #diagram .node { cursor: pointer; }
-  #diagram .node.active rect, #diagram .node.active polygon, #diagram .node.active path { stroke: var(--accent) !important; stroke-width: 3px !important; }
-  #steps { overflow: auto; padding: 16px; }
-  .step { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px; overflow: hidden; }
-  .step.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
-  .step-head { padding: 8px 12px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; cursor: pointer; }
-  .step-id { color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .step-name { font-weight: 600; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; display: flex; flex-direction: column; overflow: hidden; }
+
+  header { flex: none; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel); display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+  .meta, .legend { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; }
+  .legend i { font-style: normal; color: var(--text); }
+  .tools { margin-left: auto; display: flex; gap: 6px; }
+  button { font: inherit; font-size: 13px; color: var(--text); background: var(--btn); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  a.btn { font-size: 13px; color: var(--accent); text-decoration: none; padding: 4px 6px; }
+
+  main { flex: 1; min-height: 0; display: flex; position: relative; }
+  #viewport { flex: 1; min-width: 0; position: relative; overflow: hidden; cursor: grab; touch-action: none; }
+  #viewport.dragging { cursor: grabbing; }
+  #canvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #canvas svg { display: block; max-width: none; }
+  #canvas .node { cursor: pointer; }
+  #canvas .node.active rect, #canvas .node.active polygon, #canvas .node.active path { stroke: var(--accent) !important; stroke-width: 3px !important; }
+  .hint { position: absolute; left: 12px; bottom: 10px; font-size: 12px; color: var(--muted); pointer-events: none; }
+
+  #sidebar { flex: none; width: min(46%, 720px); border-left: 1px solid var(--border); background: var(--bg); display: flex; flex-direction: column; min-width: 0; }
+  #sidebar[hidden] { display: none; }
+  .side-head { flex: none; display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  .side-head strong { font-size: 13px; overflow-wrap: anywhere; }
+  .side-head button { margin-left: auto; padding: 2px 8px; }
+  #steps { flex: 1; overflow: auto; padding: 12px; }
+
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
+  .card-head { padding: 8px 12px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .card-name { font-weight: 600; overflow-wrap: anywhere; }
+  .card-head a { color: var(--accent); text-decoration: none; font-size: 12px; }
   .tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); }
-  .loc { min-width: 0; overflow-wrap: anywhere; color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; margin-left: auto; }
-  .ext { overflow-wrap: anywhere; padding: 0 12px 8px; color: var(--muted); font-size: 12px; }
+  .tag.error { background: transparent; border: 1px solid var(--err); color: var(--err); }
+  .loc { flex-basis: 100%; min-width: 0; overflow-wrap: anywhere; color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
   pre { tab-size: 2; margin: 0; padding: 10px 12px; background: var(--code-bg); border-top: 1px solid var(--border); overflow-x: auto; font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .unresolved { color: var(--warn); }
+  .section { margin: 14px 2px 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
   .error { padding: 20px; color: var(--warn); white-space: pre-wrap; font-family: ui-monospace, monospace; }
+
   @media (max-width: 800px) {
-    main { grid-template-columns: minmax(0, 1fr); height: auto; }
-    #diagram { border-right: 0; border-bottom: 1px solid var(--border); max-height: 70vh; padding: 16px; }
-    #steps { padding: 16px; }
+    #sidebar { position: absolute; inset: 0; width: auto; border-left: 0; z-index: 2; }
+    .legend { display: none; }
   }
 </style>
 </head>
@@ -51,11 +69,31 @@
 <header>
   <h1 id="title">Call flow</h1>
   <span class="meta" id="meta"></span>
-  <a href="" title="Re-run against the current code">Reload</a>
+  <span class="legend" aria-label="Legend">
+    <span><i>▭</i> statement calling project code</span>
+    <span><i>◇</i> branch / loop</span>
+    <span><i>⬭</i> start · return · end</span>
+    <span><i>▢</i> return from a callback (flow continues)</span>
+    <span><i>┅</i> callback body</span>
+    <span><i style="color:var(--err)">red</i> throws / returns an error</span>
+  </span>
+  <span class="tools">
+    <button id="fit" title="Fit diagram to window">Fit</button>
+    <button id="zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
+    <button id="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+    <button id="toggle" aria-pressed="true" aria-controls="sidebar" title="Show or hide the code sidebar">Code</button>
+    <a class="btn" href="" title="Re-run against the current code">Reload</a>
+  </span>
 </header>
 <main>
-  <section id="diagram" aria-label="Flow diagram"></section>
-  <section id="steps" aria-label="Steps"></section>
+  <section id="viewport" aria-label="Flow diagram">
+    <div id="canvas"></div>
+    <div class="hint">drag to pan · pinch or ctrl + scroll to zoom · click a box for its code</div>
+  </section>
+  <aside id="sidebar" aria-label="Code">
+    <div class="side-head"><strong id="side-title"></strong><button id="close" aria-label="Close code sidebar">✕</button></div>
+    <div id="steps"></div>
+  </aside>
 </main>
 <script src="/mermaid.js"></script>
 <script>
@@ -68,60 +106,145 @@ const el = (tag, cls, text) => {
   if (text != null) e.textContent = text;
   return e;
 };
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
 
-function focusStep(id, fromDiagram) {
-  document.querySelectorAll(".step.active, #diagram .node.active").forEach((e) => e.classList.remove("active"));
-  const card = document.getElementById(`step-${id}`);
-  card?.classList.add("active");
-  if (fromDiagram) card?.scrollIntoView({ behavior: "smooth", block: "start" });
-  const node = [...document.querySelectorAll("#diagram .node")].find((n) => n.id.split("-").includes(id));
-  node?.classList.add("active");
-  if (!fromDiagram) node?.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+// ---------- sidebar ----------
+
+function setSidebar(open) {
+  $("#sidebar").hidden = !open;
+  $("#toggle").setAttribute("aria-pressed", String(open));
+  store.set("flow.sidebar", open ? "open" : "closed");
 }
-window.focusStep = (id) => focusStep(id, true);
+$("#toggle").onclick = () => setSidebar($("#sidebar").hidden);
+$("#close").onclick = () => setSidebar(false);
+setSidebar(store.get("flow.sidebar") !== "closed");
+
+function card(name, location, code, tags = [], link = null) {
+  const c = el("article", "card");
+  const head = el("div", "card-head");
+  head.append(el("span", "card-name", name));
+  for (const [t, cls] of tags) head.append(el("span", `tag ${cls ?? ""}`, t));
+  if (link) head.append(link);
+  head.append(el("span", "loc", location));
+  c.append(head, el("pre", null, code));
+  return c;
+}
+
+const flowUrl = (c) => `/flow?file=${encodeURIComponent(c.file)}&line=${c.line}&column=${c.column}`;
+
+/** The clicked statement and the code of what it calls; the whole function when nothing is selected. */
+function show(id) {
+  const steps = $("#steps");
+  steps.replaceChildren();
+  const n = DATA.nodes.find((x) => x.id === id);
+  if (!n || n.kind === "start" || n.kind === "end") {
+    $("#side-title").textContent = DATA.title.replace(/^flow of /, "");
+    steps.append(card(DATA.title.replace(/^flow of /, ""), DATA.entry, DATA.code));
+    if (DATA.unresolved.length) {
+      steps.append(el("div", "section", "Unresolved calls (no declaration known to the checker)"));
+      steps.append(card("", "", DATA.unresolved.map((u) => `${u.location}  ${u.text}`).join("\n")));
+    }
+    return;
+  }
+  $("#side-title").textContent = n.label;
+  steps.append(card("statement", n.location, n.code));
+  if (n.callees.length) steps.append(el("div", "section", "Calls"));
+  for (const c of n.callees) {
+    const open = el("a", null, "Open flow →");
+    open.href = flowUrl(c);
+    const tags = [];
+    if (c.via) tags.push([`implements ${c.via}`]);
+    if (c.abstract) tags.push(["interface"]);
+    if (c.error) tags.push(["error", "error"]);
+    steps.append(card(c.name, c.location, c.code, tags, open));
+  }
+}
+
+// ---------- pan / zoom ----------
+
+const view = { x: 0, y: 0, k: 1 };
+const apply = () => { $("#canvas").style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.k})`; };
+const svgSize = () => {
+  const svg = $("#canvas svg");
+  return svg ? { w: svg.width.baseVal.value || svg.getBBox().width, h: svg.height.baseVal.value || svg.getBBox().height } : { w: 1, h: 1 };
+};
+function fit() {
+  const r = $("#viewport").getBoundingClientRect();
+  const { w, h } = svgSize();
+  view.k = Math.min(1, (r.width - 40) / w, (r.height - 40) / h);
+  view.x = (r.width - w * view.k) / 2;
+  view.y = Math.max(20, (r.height - h * view.k) / 2);
+  apply();
+}
+function zoomAt(factor, cx, cy) {
+  const k = Math.min(3, Math.max(0.05, view.k * factor));
+  view.x = cx - ((cx - view.x) * k) / view.k;
+  view.y = cy - ((cy - view.y) * k) / view.k;
+  view.k = k;
+  apply();
+}
+const center = () => { const r = $("#viewport").getBoundingClientRect(); return [r.width / 2, r.height / 2]; };
+$("#fit").onclick = fit;
+$("#zoom-in").onclick = () => zoomAt(1.25, ...center());
+$("#zoom-out").onclick = () => zoomAt(0.8, ...center());
+
+const vp = $("#viewport");
+vp.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const r = vp.getBoundingClientRect();
+  if (e.ctrlKey || e.metaKey) zoomAt(Math.exp(-e.deltaY * 0.01), e.clientX - r.left, e.clientY - r.top); // pinch arrives as ctrl+wheel
+  else { view.x -= e.deltaX; view.y -= e.deltaY; apply(); }
+}, { passive: false });
+let drag = null;
+vp.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0) return;
+  drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: false };
+});
+window.addEventListener("pointermove", (e) => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  if (!drag.moved && Math.hypot(dx, dy) < 4) return;
+  drag.moved = true;
+  vp.classList.add("dragging");
+  view.x = drag.vx + dx; view.y = drag.vy + dy; apply();
+});
+window.addEventListener("pointerup", () => { vp.classList.remove("dragging"); setTimeout(() => (drag = null)); });
+// A drag that ends on a box must not count as a click on it.
+vp.addEventListener("click", (e) => { if (drag?.moved) e.stopPropagation(); }, true);
+window.addEventListener("resize", fit);
+
+// ---------- render ----------
+
+const nodeEl = (id) => [...document.querySelectorAll("#canvas .node")].find((n) => n.id.split("-").includes(id));
+window.focusNode = (id) => {
+  document.querySelectorAll("#canvas .node.active").forEach((e) => e.classList.remove("active"));
+  nodeEl(id)?.classList.add("active");
+  setSidebar(true);
+  show(id);
+  $("#steps").scrollTop = 0;
+};
 
 async function render() {
   document.title = DATA.title;
   $("#title").textContent = DATA.title;
-  const meta = [`entry ${DATA.entry}`, `${DATA.steps.length} steps`, `depth ${DATA.depth}`];
-  if (DATA.truncated) meta.push(`stopped at ${DATA.maxNodes} steps`);
-  $("#meta").textContent = meta.join(" · ");
-
-  const steps = $("#steps");
-  for (const s of DATA.steps) {
-    const card = el("article", "step");
-    card.id = `step-${s.id}`;
-    const head = el("div", "step-head");
-    head.append(el("span", "step-id", s.id), el("span", "step-name", s.name));
-    if (s.abstract) head.append(el("span", "tag", "interface"));
-    if (s.unexpanded) head.append(el("span", "tag", "not expanded"));
-    head.append(el("span", "loc", s.location));
-    head.onclick = () => focusStep(s.id, false);
-    card.append(head);
-    if (s.externals.length) card.append(el("div", "ext", `library calls: ${s.externals.join(", ")}`));
-    card.append(el("pre", null, s.code));
-    steps.append(card);
-  }
-  if (DATA.unresolved.length) {
-    const card = el("article", "step");
-    card.append(el("div", "step-head unresolved", "Unresolved calls (no declaration known to the checker)"));
-    card.append(el("pre", null, DATA.unresolved.map((u) => `${u.location}  ${u.text}`).join("\n")));
-    steps.append(card);
-  }
+  const calls = DATA.nodes.filter((n) => n.callees.length).length;
+  $("#meta").textContent = `entry ${DATA.entry} · ${calls} steps`;
+  show(null);
 
   const dark = matchMedia("(prefers-color-scheme: dark)").matches;
   mermaid.initialize({ startOnLoad: false, securityLevel: "loose", theme: dark ? "dark" : "default", flowchart: { htmlLabels: true, useMaxWidth: false } });
-  const src = DATA.mermaid + "\n" + DATA.steps.map((s) => `  click ${s.id} call focusStep("${s.id}")`).join("\n");
-  const { svg, bindFunctions } = await mermaid.render("flow", src);
-  $("#diagram").innerHTML = svg;
-  bindFunctions?.($("#diagram"));
-  const d = $("#diagram");
-  d.scrollLeft = (d.scrollWidth - d.clientWidth) / 2; // the entry node sits in the middle
+  // Tooltip = where the statement is.
+  const clicks = DATA.nodes.map((n) => `  click ${n.id} call focusNode("${n.id}") ${JSON.stringify(n.location)}`);
+  const { svg, bindFunctions } = await mermaid.render("flow", DATA.mermaid + "\n" + clicks.join("\n"));
+  $("#canvas").innerHTML = svg;
+  bindFunctions?.($("#canvas"));
+  fit();
 }
 
-render().catch((e) => {
-  $("#diagram").replaceChildren(el("div", "error", String(e?.message ?? e)));
-});
+render().catch((e) => $("#canvas").replaceChildren(el("div", "error", String(e?.message ?? e))));
 </script>
 </body>
 </html>
