@@ -105,6 +105,11 @@
   .chip.more { color: var(--muted); border-color: var(--border); }
   .row:hover { background: var(--btn); }
   .row.dir { color: var(--muted); }
+  .row.sym { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .row.sym .line { height: 22px; }
+  .row.sym { display: flex; align-items: center; gap: 6px; }
+  .row.sym .line { flex: 0 1 auto; }
+  .row.sym .chips { padding: 0; flex-wrap: nowrap; }
   .row.selected { background: var(--accent-soft); color: var(--accent); }
   .row .caret { width: 10px; display: inline-block; font-size: 10px; }
   .row .name { overflow: hidden; text-overflow: ellipsis; }
@@ -297,64 +302,95 @@ const ROW = 26;
 
 const circled = (i) => String.fromCharCode(0x2460 + i); // ① ② ③ …
 
+// A place is a file, or `file#symbol` when that file holds several symbols of the flow (then each gets its own row,
+// so arrows between symbols of one file still show).
+const fileOfPlace = (k) => k.split("#")[0];
+const placeName = (k) => k.replace("#", " › ");
+
 function fileGraph() {
   const entryFile = fileOf(DATA.entry);
-  const rFile = Object.fromEntries(DATA.reachedFrom.map((r) => [r.id, fileOf(r.location)]));
+  const entryName = DATA.title.replace(/^flow of /, "");
+  const lineOf = (loc) => Number(loc.match(/:(\d+)$/)?.[1] ?? 0);
 
-  // Main path: the longest reached-from chain, outermost first, ending at the entry's file.
+  // every (file, symbol) the flow touches, with its first line for ordering
+  const syms = {};
+  const note = (file, name, line) => {
+    const m = (syms[file] ??= new Map());
+    if (!m.has(name) || m.get(name) > line) m.set(name, line);
+  };
+  note(entryFile, entryName, lineOf(DATA.entry));
+  for (const r of DATA.reachedFrom) {
+    note(fileOf(r.location), r.name, lineOf(r.location));
+    for (const v of r.args) note(v.file, v.name, lineOf(v.location));
+  }
+  for (const n of DATA.nodes) for (const c of n.callees) note(c.file, c.name, lineOf(c.location));
+  const place = (file, name) => (syms[file]?.size > 1 ? `${file}#${name}` : file);
+  const rPlace = Object.fromEntries(DATA.reachedFrom.map((r) => [r.id, place(fileOf(r.location), r.name)]));
+  const entry = place(entryFile, entryName);
+
+  // Main path: the longest reached-from chain, outermost first, ending at the entry.
   const chain = (id, seen = new Set()) =>
     id === "c0" || seen.has(id) ? [] : [id, ...chain(DATA.reachedFrom.find((r) => r.id === id).edges[0].to, seen.add(id))];
   const roots = DATA.reachedFrom.filter((r) => !DATA.reachedFrom.some((x) => x.edges.some((e) => e.to === r.id)));
   const longest = roots.map((r) => chain(r.id)).sort((a, b) => b.length - a.length)[0] ?? [];
   const main = [];
-  for (const f of [...longest.map((id) => rFile[id]), entryFile]) if (main.at(-1) !== f) main.push(f);
-  const station = (f) => (main.includes(f) ? circled(main.indexOf(f)) + " " : "");
-  const onMain = (from, to) => main.some((f, i) => f === from && main[i + 1] === to);
+  for (const k of [...longest.map((id) => rPlace[id]), entry]) if (main.at(-1) !== k) main.push(k);
+  const station = (k) => (main.includes(k) ? circled(main.indexOf(k)) : "");
+  const onMain = (from, to) => main.some((k, i) => k === from && main[i + 1] === to);
 
-  // Edges between files, and chips on the target file saying what arrives there and from which station.
-  const files = new Set([entryFile, ...main]);
+  // Edges between places, and chips on the target saying what arrives there and from which station.
+  const places = new Set([entry, ...main]);
   const edges = new Map();
   const chips = {};
   // src: the chart box the arrow comes from, so clicking a box lights only its own arrows
   const add = (src, from, to, kind, chip, title) => {
-    files.add(from);
-    files.add(to);
+    places.add(from);
+    places.add(to);
     if (from === to) return;
     const k = `${from}>${to}>${kind}`;
     const e = edges.get(k) ?? { from, to, kind, titles: [], srcs: [] };
     if (!e.titles.includes(title)) e.titles.push(title);
     if (!e.srcs.includes(src)) e.srcs.push(src);
     edges.set(k, e);
-    const list = (chips[to] ??= []);
     // one chip per value: the same value plugged in at several stations lists them all (②③ X)
+    const list = (chips[to] ??= []);
     const c = list.find((c) => c.kind === kind && c.name === chip) ?? (list.push({ kind, name: chip, from: [], titles: [], srcs: [] }), list.at(-1));
     if (!c.from.includes(from)) c.from.push(from);
     if (!c.titles.includes(title)) c.titles.push(title);
     if (!c.srcs.includes(src)) c.srcs.push(src);
-    c.text = c.from.map((f) => station(f).trim()).sort().join("") + (c.from.some((f) => station(f)) ? " " : "") + chip;
+    const st = c.from.map(station).sort().join("");
+    c.text = (st ? st + " " : "") + chip;
     c.title = c.titles.join("\n");
   };
   for (const r of DATA.reachedFrom) {
+    const from = rPlace[r.id];
     for (const e of r.edges) {
-      const to = e.to === "c0" ? entryFile : rFile[e.to];
-      if (onMain(rFile[r.id], to)) continue; // that's the main path itself
-      const target = e.to === "c0" ? DATA.title.replace(/^flow of /, "") : DATA.reachedFrom.find((x) => x.id === e.to).name;
-      add(r.id, rFile[r.id], to, "alt", `${r.name}`, `${target} (here) is also used by ${r.name} in ${rFile[r.id]}, via ${e.label || "a direct reference"}`);
+      const to = e.to === "c0" ? entry : rPlace[e.to];
+      if (onMain(from, to)) continue; // that's the main path itself
+      const target = e.to === "c0" ? entryName : DATA.reachedFrom.find((x) => x.id === e.to).name;
+      add(r.id, from, to, "alt", `${r.name}`, `${target} (here) is also used by ${r.name} in ${fileOf(r.location)}, via ${e.label || "a direct reference"}`);
     }
     for (const v of r.args) {
-      add(r.id, rFile[r.id], v.file, "uses", v.name, `${v.name} is defined here (${v.location}); ${r.name} in ${rFile[r.id]} plugs it into ${v.in}`);
+      add(r.id, from, place(v.file, v.name), "uses", v.name, `${v.name} is defined here (${v.location}); ${r.name} in ${fileOf(r.location)} plugs it into ${v.in}`);
     }
   }
   for (const n of DATA.nodes) {
     for (const c of n.callees) {
       const what = c.via ?? c.name;
-      add(n.id, fileOf(n.location), c.file, "calls", what, `${c.name}${c.via ? ` (implements ${c.via})` : ""} is defined here (${c.location}); called by: ${n.label} (${n.location})`);
+      add(n.id, entry, place(c.file, c.name), "calls", what, `${c.name}${c.via ? ` (implements ${c.via})` : ""} is defined here (${c.location}); called by: ${n.label} (${n.location})`);
     }
+  }
+  // symbol rows per split file, in source order
+  const symRows = {};
+  for (const [file, m] of Object.entries(syms)) {
+    if (m.size < 2) continue;
+    symRows[file] = [...m].sort((a, b) => a[1] - b[1]).map(([name]) => `${file}#${name}`).filter((k) => places.has(k));
   }
   // boxes in the diagram per file
   const boxes = {};
   for (const n of [...DATA.nodes, ...DATA.reachedFrom]) (boxes[fileOf(n.location)] ??= []).push(n.id);
-  return { entryFile, main, files: [...files].sort(), edges: [...edges.values()], chips, boxes };
+  const files = [...new Set([...places].map(fileOfPlace))].sort();
+  return { entry, main, files, symRows, edges: [...edges.values()], chips, boxes };
 }
 
 function buildTree(files) {
@@ -387,7 +423,7 @@ function drawTree() {
   const tree = $("#tree");
   tree.replaceChildren();
   const rows = []; // {kind, key, depth}
-  const rowOf = {}; // file -> visible row index (its collapsed ancestor when hidden)
+  const rowOf = {}; // place -> visible row index (its collapsed ancestor when hidden)
   const walk = (d, depth, hiddenAt) => {
     for (const c of [...d.dirs.values()].sort((a, b) => a.name.localeCompare(b.name))) {
       let at = hiddenAt;
@@ -398,9 +434,14 @@ function drawTree() {
       walk(c, depth + 1, at);
     }
     for (const f of d.files.sort()) {
-      if (hiddenAt != null) { rowOf[f] = hiddenAt; continue; }
+      const subs = g.symRows[f] ?? [];
+      if (hiddenAt != null) { for (const k of [f, ...subs]) rowOf[k] = hiddenAt; continue; }
       rows.push({ kind: "file", key: f, name: f.split("/").pop(), depth });
       rowOf[f] = rows.length - 1;
+      for (const k of subs) {
+        rows.push({ kind: "sym", key: k, file: f, name: k.slice(f.length + 1), depth: depth + 1 });
+        rowOf[k] = rows.length - 1;
+      }
     }
   };
   walk(g.tree, 0, null);
@@ -441,20 +482,23 @@ function drawTree() {
         drawTree();
       };
     } else {
-      row.dataset.file = r.key;
-      if (r.key === g.entryFile) row.classList.add("entry");
+      const file = r.file ?? r.key;
+      row.dataset.file = file;
+      if (r.key === g.entry) row.classList.add("entry");
       if (g.main.includes(r.key)) row.classList.add("on-main");
-      if (r.key === graph.selected) row.classList.add("selected");
-      line.append(el("span", "caret", ""), el("span", "name", r.name));
-      const n = g.boxes[r.key]?.length;
+      if (file === graph.selected) row.classList.add("selected");
+      line.append(el("span", "caret", r.kind === "sym" ? "·" : ""), el("span", "name", r.name));
+      const n = r.kind === "file" && g.boxes[r.key]?.length;
       if (n) line.append(el("span", "count", String(n)));
-      line.append(editorLink(r.key, "VS Code"));
+      if (r.kind === "file") line.append(editorLink(r.key, "VS Code"));
       const list = g.chips[r.key] ?? [];
       if (list.length) {
         const box = el("div", "chips");
         const MAX = 4;
         for (const c of list.slice(0, MAX)) {
-          const chip = el("span", `chip ${c.kind}`, c.text);
+          // on a symbol's own row its name is already there; keep only the stations
+          const short = c.name === r.name && (c.text.slice(0, -c.name.length).trim() || { calls: "called", uses: "plugged in", alt: "also used" }[c.kind]);
+          const chip = el("span", `chip ${c.kind}`, short || c.text);
           chip.title = c.title;
           chip.dataset.srcs = c.srcs.join(" ");
           box.append(chip);
@@ -466,12 +510,12 @@ function drawTree() {
         }
         row.append(box);
       }
-      row.onclick = () => selectFile(graph.selected === r.key ? null : r.key);
+      row.onclick = () => selectFile(graph.selected === file ? null : file);
     }
     tree.append(row);
     return row;
   });
-  const yOf = (i) => rowEls[i].offsetTop + 13; // middle of the name line
+  const yOf = (i) => rowEls[i].offsetTop + rowEls[i].firstChild.offsetHeight / 2; // middle of the name line
 
   // One trunk (the main path) at x = TRUNK; every other arrow branches off the trunk at its source's station.
   const NS = "http://www.w3.org/2000/svg";
@@ -516,7 +560,7 @@ function drawTree() {
     const x = xOf(laneOf[i]);
     const y1 = yOf(a) + d * (R + 1), y2 = yOf(b) - d * (R + 2);
     // stations on neighbouring rows: a plain link, an arrowhead wouldn't fit between the dots
-    path(`M${x} ${y1} V${y2}`, "main", `${circled(i)} → ${circled(i + 1)}  ${g.main[i]} → ${g.main[i + 1]}`, g.main[i], g.main[i + 1], Math.abs(y2 - y1) > 14);
+    path(`M${x} ${y1} V${y2}`, "main", `${circled(i)} → ${circled(i + 1)}  ${placeName(g.main[i])} → ${placeName(g.main[i + 1])}`, g.main[i], g.main[i + 1], Math.abs(y2 - y1) > 14);
   }
   // a station shared by two lanes: join its copies
   stationLanes.forEach((ls, i) => {
@@ -551,7 +595,7 @@ function drawTree() {
       Object.entries({ x: xOf(l), y: yOf(r) + 3, class: "station-n" }).forEach(([k, v]) => n.setAttribute(k, v));
       n.textContent = String(i + 1);
       const t = document.createElementNS(NS, "title");
-      t.textContent = `${circled(i)} ${f}${stationLanes[i].length > 1 ? " — the main path turns here and continues in the next lane" : ""}`;
+      t.textContent = `${circled(i)} ${placeName(f)}${stationLanes[i].length > 1 ? " — the main path turns here and continues in the next lane" : ""}`;
       c.append(t);
       svg.append(c, n);
     }
@@ -563,12 +607,12 @@ function drawTree() {
 function highlight() {
   const f = graph.selected, node = graph.node;
   // a clicked box: only the arrows and chips that box produces; a clicked file: everything touching the file
-  const hot = (x) => (node ? (x.dataset.srcs ?? "").split(" ").includes(node) : x.dataset.from === f || x.dataset.to === f);
+  const hot = (x) => (node ? (x.dataset.srcs ?? "").split(" ").includes(node) : fileOfPlace(x.dataset.from ?? "") === f || fileOfPlace(x.dataset.to ?? "") === f);
   $("#tree").classList.toggle("selecting", !!f);
   $("#tree").classList.toggle("by-node", !!(f && node));
   document.querySelectorAll("#tree svg.arrows path[data-from]").forEach((p) => p.classList.toggle("hot", hot(p)));
   document.querySelectorAll("#tree .chip[data-srcs]").forEach((c) => c.classList.toggle("hot", !!node && hot(c)));
-  document.querySelectorAll("#tree .row.file").forEach((r) => r.classList.toggle("selected", r.dataset.file === f));
+  document.querySelectorAll("#tree .row[data-file]").forEach((r) => r.classList.toggle("selected", r.dataset.file === f));
   document.querySelectorAll("#canvas .node.infile").forEach((n) => n.classList.remove("infile"));
   for (const id of (f && !node && graph.data.boxes[f]) || []) nodeEl(id)?.classList.add("infile");
 }
