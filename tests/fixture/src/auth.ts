@@ -1,0 +1,43 @@
+export function checkToken(req: string) {
+  // line 0 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 1 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 2 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 3 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 4 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 5 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 6 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 7 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 8 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 9 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 10 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 11 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 12 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 13 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 14 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 15 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 16 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 17 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 18 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 19 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 20 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 21 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 22 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 23 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 24 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 25 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 26 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 27 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 28 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 29 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 30 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 31 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 32 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 33 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 34 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 35 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 36 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 37 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 38 keeps this declaration long enough to span the use site's offset in server.ts
+  // line 39 keeps this declaration long enough to span the use site's offset in server.ts
+  return req;
+}

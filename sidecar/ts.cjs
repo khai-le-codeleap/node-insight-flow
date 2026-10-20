@@ -709,15 +709,223 @@ function controlFlow(project, entry, a, keep) {
   return { mermaid: out.join("\n"), nodes, groups, unresolved };
 }
 
+// ---------- reached from ----------
+// Where the entry is used, walked upward: the calls wrapping each use up to the named declaration around it
+// (`.handle(…)`, `.middleware(X)`, `app.get("/x", auth, h)`), project values passed to those calls, other calls on the
+// same router object, then the same for that declaration, up to module level. From findReferences + the AST only.
+
+const inside = (n, outer) =>
+  n.getSourceFile() === outer.getSourceFile() && n.getStart() >= outer.getStart() && n.getEnd() <= outer.getEnd();
+const hasAncestor = (n, pred) => {
+  for (let p = n.parent; p && !ts.isSourceFile(p); p = p.parent) if (pred(p)) return true;
+  return false;
+};
+
+/** An argument in brief; calls shown `depth` levels deep, e.g. `Layer.provide(BearerAuthLive)`. */
+function argSummary(a, depth = 2) {
+  if (ts.isStringLiteralLike(a)) return JSON.stringify(a.text);
+  if (ts.isNumericLiteral(a)) return a.text;
+  if ((ts.isIdentifier(a) || ts.isPropertyAccessExpression(a)) && a.getText().length <= 40) return a.getText().replace(/\s+/g, "");
+  if (depth > 0 && (ts.isCallExpression(a) || ts.isNewExpression(a))) return callSummary(a, false, depth - 1);
+  return "…";
+}
+
+/** `router.get("/x", auth, h)`; `.middleware(X)` for a method on a chain (`a.b(…).middleware(X)`). */
+function callSummary(call, viaReceiver, depth = 2) {
+  const e = call.expression;
+  const chained = ts.isPropertyAccessExpression(e) && (viaReceiver || ts.isCallExpression(e.expression) || e.expression.getText().length > 40);
+  const callee = chained ? `.${e.name.text}` : calleeText(call);
+  const t = `${callee}(${(call.arguments ?? []).map((x) => argSummary(x, depth)).join(", ")})`;
+  return t.length > 200 ? t.slice(0, 199) + "…" : t;
+}
+
+/** Project declaration an identifier / property access refers to, through import aliases. */
+function declOf(checker, expr) {
+  let sym = checker.getSymbolAtLocation(ts.isPropertyAccessExpression(expr) ? expr.name : expr);
+  if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
+  const d = sym?.valueDeclaration ?? sym?.declarations?.[0];
+  return d && inProject(d.getSourceFile().fileName) ? d : null;
+}
+
+/** Statement-level node to show for a declaration. */
+function statementOf(d) {
+  let n = d;
+  while (n.parent && !ts.isSourceFile(n.parent) && !ts.isBlock(n.parent) && !ts.isClassLike(n.parent) && !ts.isObjectLiteralExpression(n.parent)) n = n.parent;
+  return n;
+}
+
+/** Up to `radius` lines either side of `focus`, within `n`, the focus line marked. */
+function codeAround(n, focus, radius = 8) {
+  const sf = n.getSourceFile();
+  const first = sf.getLineAndCharacterOfPosition(n.getStart(sf)).line;
+  const last = sf.getLineAndCharacterOfPosition(n.getEnd()).line;
+  const f = sf.getLineAndCharacterOfPosition(focus).line;
+  const from = Math.max(first, f - radius);
+  const to = Math.min(last, f + radius);
+  const w = String(to + 1).length;
+  const lines = [];
+  if (from > first) lines.push(`${" ".repeat(w)}   …`);
+  for (let i = from; i <= to; i++) lines.push(`${String(i + 1).padStart(w)} ${i === f ? "▶" : "│"} ${lineText(sf, i)}`);
+  if (to < last) lines.push(`${" ".repeat(w)}   …`);
+  return lines.join("\n");
+}
+
+/** Where `u` is used (not imports, types, or its own body). An inline callback is used right where it's written. */
+function usageSites(p, u, keep) {
+  if (!u.decl.name) return isFn(u.decl) ? [{ n: u.decl, p }] : [];
+  const sf = u.decl.getSourceFile();
+  const sites = new Map();
+  for (const q of seers(sf.fileName)) {
+    for (const g of q.service.findReferences(sf.fileName, u.decl.name.getStart(sf)) ?? []) {
+      for (const r of g.references) {
+        if (r.isDefinition || !inProject(r.fileName) || !keep(r.fileName)) continue;
+        const rsf = q.program.getSourceFile(r.fileName);
+        if (!rsf) continue;
+        const n = nodeAt(rsf, r.textSpan.start);
+        if (rsf.fileName === sf.fileName && inside(n, u.decl)) continue;
+        if (hasAncestor(n, (x) => ts.isImportDeclaration(x) || ts.isExportDeclaration(x) || ts.isImportEqualsDeclaration(x) || ts.isTypeNode(x))) continue;
+        sites.set(`${r.fileName}:${r.textSpan.start}`, { n, p: q });
+      }
+    }
+  }
+  return [...sites.values()];
+}
+
+/** Calls on the same object as `call`'s receiver elsewhere (`app.use(auth)` next to `app.get(…)`). */
+function siblingCalls(p, call, chain) {
+  const e = call.expression;
+  if (!ts.isPropertyAccessExpression(e) || !ts.isIdentifier(e.expression)) return [];
+  const d = declOf(p.program.getTypeChecker(), e.expression);
+  if (!d || !(ts.isVariableDeclaration(d) || ts.isParameter(d))) return []; // an object we own, not a namespace/class
+  const sf = e.getSourceFile();
+  const out = [];
+  for (const g of p.service.findReferences(sf.fileName, e.expression.getStart(sf)) ?? []) {
+    for (const r of g.references) {
+      const rsf = p.program.getSourceFile(r.fileName);
+      const id = rsf && nodeAt(rsf, r.textSpan.start);
+      const pa = id?.parent;
+      const c = pa?.parent;
+      if (!pa || !ts.isPropertyAccessExpression(pa) || pa.expression !== id || !c || !ts.isCallExpression(c) || c.expression !== pa) continue;
+      if (chain.includes(c)) continue;
+      out.push({ location: `${rel(r.fileName)}:${at(r.fileName, c.getStart()).line}`, text: snippet(c, 80) });
+    }
+  }
+  return out.slice(0, 20);
+}
+
+/** From a use up to the declaration (or top-level statement) around it, with the calls in between. */
+function containerOf(site, p, keep) {
+  const checker = p.program.getTypeChecker();
+  const chain = [];
+  const calls = [];
+  const args = new Map();
+  let prev = site;
+  for (let n = site.parent; n; prev = n, n = n.parent) {
+    if (ts.isCallExpression(n) || ts.isNewExpression(n)) {
+      const callsEntry = n.expression === prev && (prev === site || (ts.isPropertyAccessExpression(prev) && prev.name === site));
+      if (!callsEntry) {
+        // Came up through `x.method`: the chain continues on x, show just `.method(…)`.
+        const viaReceiver = n.expression === prev && ts.isPropertyAccessExpression(prev);
+        chain.push(n);
+        calls.push(callSummary(n, viaReceiver));
+        // Project values anywhere in the wrapping call's arguments (not inside callbacks, not the path we came up).
+        const ids = [];
+        const collect = (x) => {
+          if (isFn(x) || inside(prev, x)) return;
+          if (ts.isIdentifier(x)) ids.push(x);
+          ts.forEachChild(x, collect);
+        };
+        for (const a of n.arguments ?? []) collect(a);
+        for (const a of ids) {
+          const d = declOf(checker, a);
+          if (!d || !keep(d.getSourceFile().fileName) || inside(a, d)) continue;
+          if (ts.isParameter(d) || hasAncestor(a, (x) => x === d)) continue; // a callback's own parameter
+          const dn = d.name ?? d;
+          const pos = d.getSourceFile().getLineAndCharacterOfPosition(dn.getStart());
+          args.set(`${d.getSourceFile().fileName}:${d.getStart()}`, {
+            name: ts.isPropertyAccessExpression(a.parent) && a.parent.name === a ? a.parent.getText() : a.getText(),
+            location: `${rel(d.getSourceFile().fileName)}:${pos.line + 1}`,
+            file: rel(d.getSourceFile().fileName),
+            line: pos.line + 1,
+            column: pos.character + 1,
+            fn: !!unitFromDecl(d)?.body,
+            code: codeAround(statementOf(d), dn.getStart(), 15),
+          });
+        }
+      }
+    }
+    const named = ((isHolder(n) || ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n)) && n.name) || ts.isMethodDeclaration(n);
+    if (named || (n.parent && ts.isSourceFile(n.parent))) {
+      const siblings = chain.flatMap((c) => siblingCalls(p, c, chain));
+      return { decl: named ? n : null, stmt: statementOf(n), calls, args: [...args.values()], siblings };
+    }
+  }
+  return null;
+}
+
+function reachedFrom(project, entry, keep) {
+  const out = [];
+  const byKey = new Map();
+  let frontier = [{ u: entry, p: project, child: "c0" }];
+  for (let level = 0; level < 8 && frontier.length && out.length < 30; level++) {
+    const next = [];
+    for (const { u, p, child } of frontier) {
+      for (const { n: site, p: sp } of usageSites(p, u, keep)) {
+        const c = containerOf(site, sp, keep);
+        if (!c) continue;
+        const holder = c.decl ?? c.stmt;
+        const file = holder.getSourceFile().fileName;
+        const key = `${file}:${holder.getStart()}`;
+        let r = byKey.get(key);
+        if (!r) {
+          r = {
+            id: `r${out.length}`,
+            name: c.decl ? unitName(c.decl) : `${path.basename(file)} (module)`,
+            location: `${rel(file)}:${at(file, site.getStart()).line}`,
+            registers: child,
+            edges: [],
+            calls: c.calls,
+            args: c.args,
+            siblings: c.siblings,
+            code: codeAround(c.stmt, site.getStart()),
+          };
+          byKey.set(key, r);
+          out.push(r);
+          if (c.decl) next.push({ u: { decl: c.decl }, p: sp, child: r.id });
+        }
+        if (!r.edges.some((e) => e.to === child)) r.edges.push({ to: child, label: c.calls.join(" → ") });
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
 function callFlow(project, entry, a) {
   const keep = (f) => a.includeTests || !TEST_FILE.test(f);
   const cf = controlFlow(project, entry, a, keep);
+  const regs = reachedFrom(project, entry, keep);
+  const esc = (t) => t.replace(/&/g, "#amp;").replace(/"/g, "#quot;").replace(/</g, "#lt;").replace(/>/g, "#gt;").replace(/`/g, "#96;");
+  let mermaid = cf.mermaid;
+  if (regs.length) {
+    const lines = ["  subgraph reached[\"reached from\"]", "    direction TB"];
+    for (const r of regs) lines.push(`    ${r.id}[/\"${esc(r.name)}<br/>${esc(r.location.split("/").pop())}\"\\]`);
+    lines.push("  end", "  style reached fill:none,stroke-dasharray:4 3");
+    for (const r of regs) {
+      for (const e of r.edges) {
+        const label = e.label.length > 90 ? e.label.slice(0, 89) + "…" : e.label;
+        lines.push(`  ${r.id} -->${label ? `|\"${esc(label)}\"|` : ""} ${e.to}`);
+      }
+    }
+    mermaid += "\n" + lines.join("\n");
+  }
   const data = {
     title: `flow of ${entry.name}`,
     entry: `${rel(entry.file)}:${at(entry.file, entry.decl.getStart()).line}`,
     code: codeOf(entry, a.maxLines ?? 60),
-    mermaid: cf.mermaid,
+    mermaid,
     nodes: cf.nodes,
+    reachedFrom: regs,
     unresolved: uniq(cf.unresolved).map((h) => ({ location: `${rel(h.file)}:${h.line}`, text: h.text })),
   };
   if (a.format === "json") return JSON.stringify(data);
@@ -737,6 +945,17 @@ function callFlow(project, entry, a) {
   for (const c of called.values()) {
     const tags = [c.via && `implements ${c.via}`, c.abstract && "interface", c.error && "error"].filter(Boolean);
     out += `\n### ${c.name}${tags.length ? ` (${tags.join(", ")})` : ""} — ${c.location}\n` + "```ts\n" + c.code + "\n```\n";
+  }
+  if (regs.length) {
+    out += "\nreached from (where this function is used, walked up to module level; wrapping calls innermost first):\n";
+    for (const r of regs) {
+      out += `${r.id} ${r.name} — ${r.location}  (uses ${r.registers})\n`;
+      if (r.calls.length) out += `    wrapped by: ${r.calls.join(" → ")}\n`;
+      for (const v of r.args) out += `    passes ${v.name} (${v.location})\n`;
+      for (const s of r.siblings) out += `    same object: ${s.location}  ${s.text}\n`;
+    }
+  } else {
+    out += "\nreached from: no uses found outside this function (or only in tests)\n";
   }
   if (data.unresolved.length) {
     out += `\nunresolved calls (no declaration known to the checker, e.g. \`any\`):\n`;

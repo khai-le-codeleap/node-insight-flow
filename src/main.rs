@@ -729,6 +729,34 @@ mod tests {
     }
 
     #[test]
+    fn ts_call_flow_shows_where_the_handler_is_registered() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture").canonicalize().unwrap();
+        let mut ts = None;
+        let j = semantic(&root, &mut ts, "call_flow", &json!({"symbol": "showProfile", "file": "src/server.ts", "format": "json"})).unwrap();
+        let j: Value = serde_json::from_str(&j).unwrap();
+        let regs = j["reachedFrom"].as_array().unwrap();
+        let find = |name: &str| regs.iter().find(|r| r["name"] == name).unwrap_or_else(|| panic!("no {name} in {regs:#?}"));
+
+        // Express-style: registered at module level, with the auth argument and the other calls on `router`.
+        let module = find("server.ts (module)");
+        assert_eq!(module["calls"][0], "router.get(\"/profile\", requireAuth, checkToken, showProfile)");
+        let args: Vec<&str> = module["args"].as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap()).collect();
+        // checkToken lives in another file whose declaration spans this offset: must still be listed.
+        assert!(args.contains(&"requireAuth") && args.contains(&"checkToken"), "{args:?}");
+        assert!(module["siblings"].as_array().unwrap().iter().any(|s| s["text"] == "router.use(requireAuth)"));
+
+        // Builder-style: inside webGroup, wrapped by handle → group → .middleware(requireAuth); then server uses webGroup.
+        let web = find("webGroup");
+        let calls: Vec<&str> = web["calls"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+        assert_eq!(calls, ["g.handle(\"profile\", …)", "group(\"web\", …)", ".middleware(requireAuth)"]);
+        let server = find("server");
+        assert_eq!(server["registers"], web["id"]);
+
+        let m = j["mermaid"].as_str().unwrap();
+        assert!(m.contains(&format!("{} -->", web["id"].as_str().unwrap())) && m.contains("subgraph reached"), "{m}");
+    }
+
+    #[test]
     fn url_args_round_trip() {
         let a = json!({"symbol": "a b/ç&x", "line": 12, "includeTests": true});
         let url = flow_url(1, &a);

@@ -57,10 +57,31 @@
   .loc { flex-basis: 100%; min-width: 0; overflow-wrap: anywhere; color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
   pre { tab-size: 2; margin: 0; padding: 10px 12px; background: var(--code-bg); border-top: 1px solid var(--border); overflow-x: auto; font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
   .section { margin: 14px 2px 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  #files { flex: none; width: 300px; border-right: 1px solid var(--border); background: var(--bg); display: flex; flex-direction: column; min-width: 0; }
+  #files[hidden] { display: none; }
+  .files-legend { flex: none; display: flex; gap: 10px; flex-wrap: wrap; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+  .files-legend svg { vertical-align: middle; }
+  #tree { flex: 1; overflow: auto; position: relative; padding: 6px 0; }
+  #tree svg.arrows { position: absolute; left: 0; top: 6px; overflow: visible; pointer-events: none; }
+  #tree svg.arrows path { fill: none; stroke-width: 1.5; pointer-events: stroke; cursor: default; }
+  #tree svg.arrows path.calls { stroke: var(--accent); }
+  #tree svg.arrows path.wraps { stroke: var(--muted); stroke-dasharray: 5 3; }
+  #tree svg.arrows path.uses { stroke: var(--warn); stroke-dasharray: 1 3; stroke-linecap: round; }
+  #tree.selecting svg.arrows path { opacity: .15; }
+  #tree.selecting svg.arrows path.hot { opacity: 1; stroke-width: 2.5; }
+  .row { height: 26px; display: flex; align-items: center; gap: 6px; padding-right: 10px; white-space: nowrap; cursor: pointer; font-size: 13px; }
+  .row:hover { background: var(--btn); }
+  .row.dir { color: var(--muted); }
+  .row.selected { background: var(--accent-soft); color: var(--accent); }
+  .row .caret { width: 10px; display: inline-block; font-size: 10px; }
+  .row .name { overflow: hidden; text-overflow: ellipsis; }
+  .row .count { margin-left: auto; font-size: 11px; color: var(--muted); }
+  .row.entry .name { font-weight: 600; }
+  #canvas .node.infile rect, #canvas .node.infile polygon, #canvas .node.infile path { stroke: var(--accent) !important; stroke-width: 2px !important; stroke-dasharray: 5 3; }
   .error { padding: 20px; color: var(--warn); white-space: pre-wrap; font-family: ui-monospace, monospace; }
 
   @media (max-width: 800px) {
-    #sidebar { position: absolute; inset: 0; width: auto; border-left: 0; z-index: 2; }
+    #sidebar, #files { position: absolute; inset: 0; width: auto; border: 0; z-index: 2; }
     .legend { display: none; }
   }
 </style>
@@ -75,17 +96,28 @@
     <span><i>⬭</i> start · return · end</span>
     <span><i>▢</i> return from a callback (flow continues)</span>
     <span><i>┅</i> callback body</span>
+    <span><i>⏢</i> reached from (where it's registered / used)</span>
     <span><i style="color:var(--err)">red</i> throws / returns an error</span>
   </span>
   <span class="tools">
     <button id="fit" title="Fit diagram to window">Fit</button>
     <button id="zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
     <button id="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+    <button id="files-toggle" aria-pressed="true" aria-controls="files" title="Show or hide the file tree">Files</button>
     <button id="toggle" aria-pressed="true" aria-controls="sidebar" title="Show or hide the code sidebar">Code</button>
     <a class="btn" href="" title="Re-run against the current code">Reload</a>
   </span>
 </header>
 <main>
+  <aside id="files" aria-label="Files in this flow">
+    <div class="side-head"><strong id="files-title">Files</strong><button id="files-close" aria-label="Close file tree">✕</button></div>
+    <div class="files-legend" aria-label="Arrow legend">
+      <span><svg width="22" height="8"><path d="M1 4H21" stroke="var(--accent)" stroke-width="1.5"/></svg> calls into</span>
+      <span><svg width="22" height="8"><path d="M1 4H21" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="5 3"/></svg> wraps / registers</span>
+      <span><svg width="22" height="8"><path d="M1 4H21" stroke="var(--warn)" stroke-width="1.5" stroke-dasharray="1 3" stroke-linecap="round"/></svg> passes a value from</span>
+    </div>
+    <div id="tree" role="tree"></div>
+  </aside>
   <section id="viewport" aria-label="Flow diagram">
     <div id="canvas"></div>
     <div class="hint">drag to pan · pinch or ctrl + scroll to zoom · click a box for its code</div>
@@ -139,6 +171,8 @@ const flowUrl = (c) => `/flow?file=${encodeURIComponent(c.file)}&line=${c.line}&
 function show(id) {
   const steps = $("#steps");
   steps.replaceChildren();
+  const r = DATA.reachedFrom.find((x) => x.id === id);
+  if (r) return showRegistration(r);
   const n = DATA.nodes.find((x) => x.id === id);
   if (!n || n.kind === "start" || n.kind === "end") {
     $("#side-title").textContent = DATA.title.replace(/^flow of /, "");
@@ -162,6 +196,212 @@ function show(id) {
     steps.append(card(c.name, c.location, c.code, tags, open));
   }
 }
+
+/** A place the function is used from: the code there, the wrapping calls, values passed, calls on the same object. */
+function showRegistration(r) {
+  const steps = $("#steps");
+  $("#side-title").textContent = `reached from ${r.name}`;
+  steps.append(card(r.name, r.location, r.code));
+  if (r.calls.length) {
+    steps.append(el("div", "section", "Wrapped by (innermost first)"));
+    steps.append(card("", "", r.calls.join("\n")));
+  }
+  if (r.args.length) steps.append(el("div", "section", "Project values passed to those calls"));
+  for (const v of r.args) {
+    let link = null;
+    if (v.fn) {
+      link = el("a", null, "Open flow →");
+      link.href = flowUrl(v);
+    }
+    steps.append(card(v.name, v.location, v.code, [], link));
+  }
+  if (r.siblings.length) {
+    steps.append(el("div", "section", "Other calls on the same object"));
+    steps.append(card("", "", r.siblings.map((x) => `${x.location}  ${x.text}`).join("\n")));
+  }
+}
+
+// ---------- file tree with arrows ----------
+// Files touched by this flow, as a tree; arrows in the left gutter go from the file doing something to the file it
+// reaches: calls (a statement calls a function there), wraps (a declaration there registers/uses the next level),
+// uses (a wrapping call passes a value defined there). All derived from DATA, nothing new from the server.
+
+const fileOf = (loc) => loc.replace(/:\d+$/, "");
+const ROW = 26;
+
+function fileGraph() {
+  const entryFile = fileOf(DATA.entry);
+  const files = new Set([entryFile]);
+  const edges = new Map();
+  const add = (from, to, kind) => {
+    files.add(from);
+    files.add(to);
+    if (from === to) return;
+    const k = `${from}>${to}>${kind}`;
+    const e = edges.get(k) ?? { from, to, kind, n: 0 };
+    e.n++;
+    edges.set(k, e);
+  };
+  const rFile = Object.fromEntries(DATA.reachedFrom.map((r) => [r.id, fileOf(r.location)]));
+  for (const r of DATA.reachedFrom) {
+    for (const e of r.edges) add(rFile[r.id], e.to === "c0" ? entryFile : rFile[e.to], "wraps");
+    for (const v of r.args) add(rFile[r.id], v.file, "uses");
+  }
+  for (const n of DATA.nodes) for (const c of n.callees) add(fileOf(n.location), c.file, "calls");
+  // boxes in the diagram per file
+  const boxes = {};
+  for (const n of [...DATA.nodes, ...DATA.reachedFrom]) (boxes[fileOf(n.location)] ??= []).push(n.id);
+  return { entryFile, files: [...files].sort(), edges: [...edges.values()], boxes };
+}
+
+function buildTree(files) {
+  const root = { key: "", name: "", dirs: new Map(), files: [] };
+  for (const f of files) {
+    let d = root;
+    const parts = f.split("/");
+    for (const p of parts.slice(0, -1)) {
+      if (!d.dirs.has(p)) d.dirs.set(p, { key: d.key ? `${d.key}/${p}` : p, name: p, dirs: new Map(), files: [] });
+      d = d.dirs.get(p);
+    }
+    d.files.push(f);
+  }
+  // `server/src/http` instead of three single-child rows
+  const squash = (d) => {
+    for (const c of d.dirs.values()) squash(c);
+    if (d !== root && d.dirs.size === 1 && d.files.length === 0) {
+      const [c] = d.dirs.values();
+      Object.assign(d, { key: c.key, name: `${d.name}/${c.name}`, dirs: c.dirs, files: c.files });
+    }
+  };
+  squash(root);
+  return root;
+}
+
+const graph = { collapsed: new Set(), selected: null };
+
+function drawTree() {
+  const g = graph.data;
+  const tree = $("#tree");
+  tree.replaceChildren();
+  const rows = []; // {kind, key, depth}
+  const rowOf = {}; // file -> visible row index (its collapsed ancestor when hidden)
+  const walk = (d, depth, hiddenAt) => {
+    for (const c of [...d.dirs.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+      let at = hiddenAt;
+      if (at == null) {
+        rows.push({ kind: "dir", key: c.key, name: c.name, depth });
+        if (graph.collapsed.has(c.key)) at = rows.length - 1;
+      }
+      walk(c, depth + 1, at);
+    }
+    for (const f of d.files.sort()) {
+      if (hiddenAt != null) { rowOf[f] = hiddenAt; continue; }
+      rows.push({ kind: "file", key: f, name: f.split("/").pop(), depth });
+      rowOf[f] = rows.length - 1;
+    }
+  };
+  walk(g.tree, 0, null);
+
+  // Lanes: shortest spans nearest the names, an edge takes the first lane free over its span.
+  const edges = g.edges
+    .map((e) => ({ ...e, a: rowOf[e.from], b: rowOf[e.to] }))
+    .filter((e) => e.a != null && e.b != null && e.a !== e.b)
+    .sort((x, y) => Math.abs(x.a - x.b) - Math.abs(y.a - y.b));
+  const lanes = [];
+  for (const e of edges) {
+    const lo = Math.min(e.a, e.b), hi = Math.max(e.a, e.b);
+    let l = lanes.findIndex((used) => used.every(([u, v]) => hi < u || lo > v));
+    if (l < 0) { lanes.push([]); l = lanes.length - 1; }
+    lanes[l].push([lo, hi]);
+    e.lane = l;
+  }
+  const gutter = 18 + lanes.length * 7;
+
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.classList.add("arrows");
+  svg.setAttribute("width", gutter);
+  svg.setAttribute("height", rows.length * ROW);
+  const defs = document.createElementNS(NS, "defs");
+  for (const [kind, color] of [["calls", "var(--accent)"], ["wraps", "var(--muted)"], ["uses", "var(--warn)"]]) {
+    const m = document.createElementNS(NS, "marker");
+    Object.entries({ id: `arrow-${kind}`, viewBox: "0 0 8 8", refX: 7, refY: 4, markerWidth: 7, markerHeight: 7, orient: "auto" }).forEach(([k, v]) => m.setAttribute(k, v));
+    const tip = document.createElementNS(NS, "path");
+    tip.setAttribute("d", "M0 0L8 4L0 8z");
+    tip.style.fill = color;
+    m.append(tip);
+    defs.append(m);
+  }
+  svg.append(defs);
+  for (const e of edges) {
+    const y1 = e.a * ROW + ROW / 2, y2 = e.b * ROW + ROW / 2;
+    const xr = gutter - 3, xl = gutter - 12 - e.lane * 7;
+    const path = document.createElementNS(NS, "path");
+    path.setAttribute("d", `M${xr} ${y1} C${xl} ${y1} ${xl} ${y2} ${xr} ${y2}`);
+    path.setAttribute("marker-end", `url(#arrow-${e.kind})`);
+    path.classList.add(e.kind);
+    path.dataset.from = e.from;
+    path.dataset.to = e.to;
+    const verb = { calls: "calls into", wraps: "wraps / registers", uses: "passes a value from" }[e.kind];
+    const title = document.createElementNS(NS, "title");
+    title.textContent = `${e.from} ${verb} ${e.to}${e.n > 1 ? ` (×${e.n})` : ""}`;
+    path.append(title);
+    svg.append(path);
+  }
+  tree.append(svg);
+
+  for (const r of rows) {
+    const row = el("div", `row ${r.kind}`);
+    row.style.paddingLeft = `${gutter + 4 + r.depth * 14}px`;
+    row.setAttribute("role", "treeitem");
+    row.title = r.key;
+    if (r.kind === "dir") {
+      const open = !graph.collapsed.has(r.key);
+      row.setAttribute("aria-expanded", String(open));
+      row.append(el("span", "caret", open ? "▾" : "▸"), el("span", "name", `${r.name}/`));
+      row.onclick = () => {
+        graph.collapsed[open ? "add" : "delete"](r.key);
+        drawTree();
+      };
+    } else {
+      row.dataset.file = r.key;
+      if (r.key === g.entryFile) row.classList.add("entry");
+      if (r.key === graph.selected) row.classList.add("selected");
+      row.append(el("span", "caret", ""), el("span", "name", r.name));
+      const n = g.boxes[r.key]?.length;
+      if (n) row.append(el("span", "count", String(n)));
+      row.onclick = () => selectFile(graph.selected === r.key ? null : r.key);
+    }
+    tree.append(row);
+  }
+  highlight();
+}
+
+function highlight() {
+  const f = graph.selected;
+  $("#tree").classList.toggle("selecting", !!f);
+  document.querySelectorAll("#tree svg.arrows path[data-from]").forEach((p) => p.classList.toggle("hot", p.dataset.from === f || p.dataset.to === f));
+  document.querySelectorAll("#tree .row.file").forEach((r) => r.classList.toggle("selected", r.dataset.file === f));
+  document.querySelectorAll("#canvas .node.infile").forEach((n) => n.classList.remove("infile"));
+  for (const id of (f && graph.data.boxes[f]) || []) nodeEl(id)?.classList.add("infile");
+}
+
+function selectFile(f) {
+  graph.selected = f;
+  // reveal it if it sits in a collapsed directory
+  if (f) for (const k of [...graph.collapsed]) if (f.startsWith(k + "/")) graph.collapsed.delete(k);
+  drawTree();
+  document.querySelector(`#tree .row.selected`)?.scrollIntoView({ block: "nearest" });
+}
+
+function setFiles(open) {
+  $("#files").hidden = !open;
+  $("#files-toggle").setAttribute("aria-pressed", String(open));
+  store.set("flow.files", open ? "open" : "closed");
+}
+$("#files-toggle").onclick = () => setFiles($("#files").hidden);
+$("#files-close").onclick = () => setFiles(false);
+setFiles(store.get("flow.files") ? store.get("flow.files") === "open" : innerWidth > 800);
 
 // ---------- pan / zoom ----------
 
@@ -224,6 +464,8 @@ window.focusNode = (id) => {
   nodeEl(id)?.classList.add("active");
   setSidebar(true);
   show(id);
+  const loc = [...DATA.nodes, ...DATA.reachedFrom].find((n) => n.id === id)?.location;
+  if (loc) selectFile(fileOf(loc));
   $("#steps").scrollTop = 0;
 };
 
@@ -237,11 +479,16 @@ async function render() {
   const dark = matchMedia("(prefers-color-scheme: dark)").matches;
   mermaid.initialize({ startOnLoad: false, securityLevel: "loose", theme: dark ? "dark" : "default", flowchart: { htmlLabels: true, useMaxWidth: false } });
   // Tooltip = where the statement is.
-  const clicks = DATA.nodes.map((n) => `  click ${n.id} call focusNode("${n.id}") ${JSON.stringify(n.location)}`);
+  const clicks = [...DATA.nodes, ...DATA.reachedFrom].map((n) => `  click ${n.id} call focusNode("${n.id}") ${JSON.stringify(n.location)}`);
   const { svg, bindFunctions } = await mermaid.render("flow", DATA.mermaid + "\n" + clicks.join("\n"));
   $("#canvas").innerHTML = svg;
   bindFunctions?.($("#canvas"));
   fit();
+
+  graph.data = fileGraph();
+  graph.data.tree = buildTree(graph.data.files);
+  $("#files-title").textContent = `Files (${graph.data.files.length})`;
+  drawTree();
 }
 
 render().catch((e) => $("#canvas").replaceChildren(el("div", "error", String(e?.message ?? e))));
