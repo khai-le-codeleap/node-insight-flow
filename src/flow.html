@@ -618,7 +618,12 @@ function drawTree() {
 function highlight() {
   const f = graph.selected, node = graph.node;
   // a clicked box: only the arrows and chips that box produces; a clicked file: everything touching the file
-  const hot = (x) => (node ? (x.dataset.srcs ?? "").split(" ").includes(node) : fileOfPlace(x.dataset.from ?? "") === f || fileOfPlace(x.dataset.to ?? "") === f);
+  // the start/end box stands for the whole function: its statements' arrows plus the boxes that use it
+  const whole = node && DATA.nodes.some((n) => n.id === node && (n.kind === "start" || n.kind === "end"));
+  const ids = !node ? [] : whole
+    ? [...DATA.nodes.map((n) => n.id), ...DATA.reachedFrom.filter((r) => r.edges.some((e) => e.to === "c0")).map((r) => r.id)]
+    : [node];
+  const hot = (x) => (node ? (x.dataset.srcs ?? "").split(" ").some((s) => ids.includes(s)) : fileOfPlace(x.dataset.from ?? "") === f || fileOfPlace(x.dataset.to ?? "") === f);
   $("#tree").classList.toggle("selecting", !!f);
   $("#tree").classList.toggle("by-node", !!(f && node));
   document.querySelectorAll("#tree svg.arrows path[data-from]").forEach((p) => p.classList.toggle("hot", hot(p)));
