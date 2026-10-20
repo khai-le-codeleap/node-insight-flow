@@ -1,0 +1,56 @@
+# Push a tag like v0.1.0 to build one archive per platform and attach them to a GitHub release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin, cross: true } # no Intel runners left: cross-build, untested
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - uses: oven-sh/setup-bun@v2
+      - run: cd sidecar && bun install --frozen-lockfile
+      - if: ${{ !matrix.cross }}
+        run: cargo test --release
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          d=node-insight-flow
+          mkdir -p dist/$d/sidecar
+          cp target/${{ matrix.target }}/release/node-insight-flow dist/$d/
+          # only what runs: the TypeScript package and the one mermaid file the page loads
+          mkdir -p dist/$d/sidecar/node_modules/mermaid/dist
+          cp sidecar/ts.cjs sidecar/package.json dist/$d/sidecar/
+          cp -R sidecar/node_modules/typescript dist/$d/sidecar/node_modules/
+          cp sidecar/node_modules/mermaid/dist/mermaid.min.js dist/$d/sidecar/node_modules/mermaid/dist/
+          cp README.md dist/$d/
+          tar -C dist -czf node-insight-flow-${{ matrix.target }}.tar.gz $d
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: node-insight-flow-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: node-insight-flow-*.tar.gz
+          generate_release_notes: true

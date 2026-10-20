@@ -3,7 +3,19 @@
 MCP server (stdio) written in Rust. It adds what Claude Code's built-in Grep/Glob/Read can't do well:
 semantic TypeScript navigation (like VSCode), section-level Markdown reading, and log summaries.
 
-## Build
+## Install
+
+Requires [Bun](https://bun.sh) at runtime (it runs the TypeScript sidecar). macOS (arm64, x64) and Linux (x64, arm64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/khai-le-codeleap/node-insight-flow/main/install.sh | sh
+```
+
+It downloads the latest release into `~/.node-insight-flow` (override with `NODE_INSIGHT_FLOW_DIR`) and, if `claude` is on your PATH, registers it at user scope. Or download an archive from [Releases](https://github.com/khai-le-codeleap/node-insight-flow/releases), extract it anywhere and run `claude mcp add --scope user node-insight-flow -- /path/to/node-insight-flow/node-insight-flow`. Keep the `sidecar/` folder next to the binary.
+
+Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed.
+
+## Build from source
 
 Requires Rust and [Bun](https://bun.sh).
 
@@ -19,7 +31,7 @@ claude mcp add --scope user node-insight-flow -- /path/to/node-insight-flow/targ
 ```
 
 The project root is the first argument, or the current directory (where `claude` runs). All paths are relative to it; paths escaping it are rejected.
-The binary loads `sidecar/ts.cjs` from this repo, so keep the repo where it was built.
+The binary loads `sidecar/` from next to itself, else from the repo it was built in.
 
 ## Tools
 

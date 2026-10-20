@@ -16,8 +16,7 @@ type R = Result<String, String>;
 
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_LINE_CHARS: usize = 200;
-const SIDECAR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/sidecar/ts.cjs");
-const MERMAID_JS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/sidecar/node_modules/mermaid/dist/mermaid.min.js");
+const MERMAID_JS: &str = "node_modules/mermaid/dist/mermaid.min.js";
 const FLOW_HTML: &str = include_str!("flow.html");
 
 /// The sidecar, shared by the stdio loop and the HTTP thread.
@@ -168,15 +167,22 @@ struct Sidecar {
     stdout: BufReader<ChildStdout>,
 }
 
+/// `sidecar/` next to the binary (release archive), else the one in the source tree it was built from.
+fn sidecar_dir() -> PathBuf {
+    let next = std::env::current_exe().and_then(|e| e.canonicalize()).ok().and_then(|e| Some(e.parent()?.join("sidecar")));
+    next.filter(|d| d.join("ts.cjs").is_file()).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("sidecar"))
+}
+
 impl Sidecar {
     fn spawn(root: &Path) -> io::Result<Self> {
+        let script = sidecar_dir().join("ts.cjs");
         let mut child = Command::new("bun")
-            .arg(SIDECAR)
+            .arg(&script)
             .arg(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .map_err(|e| io::Error::other(format!("cannot start `bun {SIDECAR}`: {e}")))?;
+            .map_err(|e| io::Error::other(format!("cannot start `bun {}` (is Bun installed? https://bun.sh): {e}", script.display())))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Ok(Self { child, stdin, stdout })
@@ -272,10 +278,13 @@ fn serve(root: &Path, ts: &Ts, port: u16, mut stream: TcpStream) -> io::Result<(
     let target = request.split_whitespace().nth(1).unwrap_or("/");
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     match path {
-        "/mermaid.js" => match std::fs::read(MERMAID_JS) {
-            Ok(js) => respond(&mut stream, "200 OK", "text/javascript", &js),
-            Err(e) => respond(&mut stream, "500 Internal Server Error", "text/plain", format!("{MERMAID_JS}: {e} (run `bun install` in sidecar/)").as_bytes()),
-        },
+        "/mermaid.js" => {
+            let file = sidecar_dir().join(MERMAID_JS);
+            match std::fs::read(&file) {
+                Ok(js) => respond(&mut stream, "200 OK", "text/javascript", &js),
+                Err(e) => respond(&mut stream, "500 Internal Server Error", "text/plain", format!("{}: {e} (run `bun install` in sidecar/)", file.display()).as_bytes()),
+            }
+        }
         "/flow" => {
             let mut a = query_args(query);
             a["format"] = json!("json");
